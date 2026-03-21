@@ -7,7 +7,7 @@
 	Dex++ REMASTERED is an enhanced revival of Moon's Dex with improved UI,
 	smooth hover effects, additional features, and fixed decompiler support.
 ]]
--- hi
+
 local selection
 local nodes = {}
 
@@ -16078,11 +16078,20 @@ local function ShowToast(message, subtext, duration, color)
 	duration = duration or 3
 	color    = color    or Color3.fromRGB(11, 90, 175)
 
-	local container = game:GetService("Players").LocalPlayer
-		and game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
-		or (gethui and gethui() or game:GetService("CoreGui"))
+	-- use oldgame so we aren't hitting the shadowed local 'game = workspace.Parent'
+	local ts        = oldgame:GetService("TweenService")
+	local Players   = oldgame:GetService("Players")
+	local CoreGui   = pcall(function() oldgame:GetService("CoreGui"):GetFullName() end) and oldgame:GetService("CoreGui")
 
-	local ts = game:GetService("TweenService")
+	local container
+	if gethui then
+		container = gethui()
+	elseif CoreGui then
+		container = CoreGui
+	elseif Players.LocalPlayer then
+		container = Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	end
+	if not container then return end
 
 	local gui = Instance.new("ScreenGui")
 	gui.Name  = "_DPP_Toast_" .. tostring(os.time())
@@ -16188,8 +16197,8 @@ end
 -- ============================================================
 -- UPDATE CHECKER (polls GitHub every 5 seconds)
 -- ============================================================
-local UPDATE_URL     = "https://raw.githubusercontent.com/nonmex9-design/DexPlusPlus-RM-Remastered-/refs/heads/main/test.luaU"
-local _lastSourceHash = nil
+local UPDATE_URL_BASE = "https://raw.githubusercontent.com/nonmex9-design/DexPlusPlus-RM-Remastered-/refs/heads/main/test.luaU"
+local _lastSourceHash  = nil
 local _updateToastShown = false
 
 local function SimpleHash(str)
@@ -16201,28 +16210,42 @@ local function SimpleHash(str)
 	return tostring(h)
 end
 
+local function FetchLatestSource()
+	-- append a cache-buster so GitHub CDN never serves a stale response
+	local url = UPDATE_URL_BASE .. "?cb=" .. tostring(os.time())
+	local ok, body = pcall(function()
+		return oldgame:HttpGet(url, true)
+	end)
+	if ok and type(body) == "string" and #body > 10 then
+		return body
+	end
+	return nil
+end
+
 local function StartUpdateChecker()
 	coroutine.wrap(function()
+		-- grab baseline immediately on first run
+		local baseline = FetchLatestSource()
+		if baseline then
+			_lastSourceHash = SimpleHash(baseline)
+		end
+
 		while true do
 			task.wait(5)
-			local ok, body = pcall(function()
-				return game:HttpGet(UPDATE_URL, true)
-			end)
-			if ok and body and #body > 0 then
+			local body = FetchLatestSource()
+			if body then
 				local hash = SimpleHash(body)
 				if _lastSourceHash == nil then
-					-- first successful fetch — record as baseline
 					_lastSourceHash = hash
 				elseif hash ~= _lastSourceHash and not _updateToastShown then
-					_lastSourceHash    = hash
-					_updateToastShown  = true
+					_lastSourceHash   = hash
+					_updateToastShown = true
 					ShowToast(
 						"🔄  Update Available!",
-						"A new version of Dex++ REMASTERED was pushed.\nRe-run the script to load it.",
-						6,
+						"Dex++ REMASTERED was updated — re-run to load it.",
+						7,
 						Color3.fromRGB(11, 148, 68)
 					)
-					-- allow showing again after 60 s so they aren't spammed
 					coroutine.wrap(function()
 						task.wait(60)
 						_updateToastShown = false
@@ -16237,9 +16260,11 @@ end
 -- ALREADY-OPEN DETECTION + STARTUP
 -- ============================================================
 local function GetSecureContainerEarly()
+	-- use oldgame so we aren't calling on the shadowed local 'game'
+	local elevated = pcall(function() oldgame:GetService("CoreGui"):GetFullName() end)
 	return (gethui and gethui())
-		or (pcall(function() game:GetService("CoreGui"):GetFullName() end) and game:GetService("CoreGui"))
-		or game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		or (elevated and oldgame:GetService("CoreGui"))
+		or oldgame:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
 end
 
 local function IsDexAlreadyOpen()
@@ -16270,7 +16295,7 @@ if IsDexAlreadyOpen() then
 		2.5,
 		Color3.fromRGB(200, 120, 20)
 	)
-	task.wait(0.6)  -- let toast slide in before we nuke the GUI
+	task.wait(0.6)
 	DestroyExistingDex()
 	task.wait(0.3)
 end
