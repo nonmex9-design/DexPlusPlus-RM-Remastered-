@@ -2406,6 +2406,8 @@ local function main()
 				return obj:InvokeServer(table.unpack(args))
 			end)
 		end})
+
+		local ClassFire = {
 			RemoteEvent = "FireServer",
 			RemoteFunction = "InvokeServer",
 			UnreliableRemoteEvent = "FireServer",
@@ -16069,7 +16071,214 @@ Main = (function()
 	return Main
 end)()
 
--- Start
+-- ============================================================
+-- TOAST NOTIFICATION SYSTEM
+-- ============================================================
+local function ShowToast(message, subtext, duration, color)
+	duration = duration or 3
+	color    = color    or Color3.fromRGB(11, 90, 175)
+
+	local container = game:GetService("Players").LocalPlayer
+		and game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+		or (gethui and gethui() or game:GetService("CoreGui"))
+
+	local ts = game:GetService("TweenService")
+
+	local gui = Instance.new("ScreenGui")
+	gui.Name  = "_DPP_Toast_" .. tostring(os.time())
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999999
+	gui.ResetOnSpawn = false
+	if gethui then
+		gui.Parent = gethui()
+	elseif pcall(function() game:GetService("CoreGui"):GetFullName() end) then
+		gui.Parent = game:GetService("CoreGui")
+	else
+		gui.Parent = container
+	end
+
+	-- Outer card
+	local card = Instance.new("Frame", gui)
+	card.AnchorPoint  = Vector2.new(0.5, 0)
+	card.Position     = UDim2.new(0.5, 0, 0, -90)
+	card.Size         = UDim2.new(0, 340, 0, subtext and 66 or 48)
+	card.BackgroundColor3 = Color3.fromRGB(28, 28, 28)
+	card.BorderSizePixel  = 0
+	card.ZIndex = 10
+	local cardCorner = Instance.new("UICorner", card); cardCorner.CornerRadius = UDim.new(0, 10)
+	local cardStroke = Instance.new("UIStroke",  card)
+	cardStroke.Color       = color
+	cardStroke.Thickness   = 1.5
+	cardStroke.Transparency = 0.35
+
+	-- Colour accent bar on left
+	local accent = Instance.new("Frame", card)
+	accent.Size             = UDim2.new(0, 4, 1, -16)
+	accent.Position         = UDim2.new(0, 8, 0, 8)
+	accent.BackgroundColor3 = color
+	accent.BorderSizePixel  = 0
+	local accentCorner = Instance.new("UICorner", accent); accentCorner.CornerRadius = UDim.new(0, 3)
+
+	-- Main message
+	local label = Instance.new("TextLabel", card)
+	label.BackgroundTransparency = 1
+	label.Position  = UDim2.new(0, 20, 0, subtext and 10 or 0)
+	label.Size      = UDim2.new(1, -28, 0, subtext and 24 or 48)
+	label.Text      = message
+	label.TextColor3 = Color3.fromRGB(235, 235, 235)
+	label.Font       = Enum.Font.SourceSansBold
+	label.TextSize   = 15
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.ZIndex = 11
+
+	-- Sub-text
+	if subtext then
+		local sub = Instance.new("TextLabel", card)
+		sub.BackgroundTransparency = 1
+		sub.Position  = UDim2.new(0, 20, 0, 34)
+		sub.Size      = UDim2.new(1, -28, 0, 20)
+		sub.Text      = subtext
+		sub.TextColor3 = Color3.fromRGB(160, 160, 160)
+		sub.Font       = Enum.Font.SourceSans
+		sub.TextSize   = 13
+		sub.TextXAlignment = Enum.TextXAlignment.Left
+		sub.ZIndex = 11
+	end
+
+	-- Drop shadow simulation
+	local shadow = Instance.new("Frame", card)
+	shadow.Size             = UDim2.new(1, 8, 1, 8)
+	shadow.Position         = UDim2.new(0, -4, 0, 4)
+	shadow.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+	shadow.BackgroundTransparency = 0.65
+	shadow.BorderSizePixel  = 0
+	shadow.ZIndex = 9
+	local shadowCorner = Instance.new("UICorner", shadow); shadowCorner.CornerRadius = UDim.new(0, 12)
+
+	local slideInTI  = TweenInfo.new(0.45, Enum.EasingStyle.Quint, Enum.EasingDirection.Out)
+	local slideOutTI = TweenInfo.new(0.35, Enum.EasingStyle.Quint, Enum.EasingDirection.In)
+
+	-- Slide in from top
+	ts:Create(card, slideInTI, {Position = UDim2.new(0.5, 0, 0, 18)}):Play()
+
+	-- Progress bar underline
+	local bar = Instance.new("Frame", card)
+	bar.Size             = UDim2.new(1, 0, 0, 3)
+	bar.Position         = UDim2.new(0, 0, 1, -3)
+	bar.BackgroundColor3 = color
+	bar.BorderSizePixel  = 0
+	bar.ZIndex = 12
+	local barCorner = Instance.new("UICorner", bar); barCorner.CornerRadius = UDim.new(0, 3)
+	ts:Create(bar, TweenInfo.new(duration, Enum.EasingStyle.Linear), {Size = UDim2.new(0, 0, 0, 3)}):Play()
+
+	coroutine.wrap(function()
+		task.wait(duration)
+		ts:Create(card, slideOutTI, {
+			Position = UDim2.new(0.5, 0, 0, -90),
+			BackgroundTransparency = 1
+		}):Play()
+		ts:Create(label, slideOutTI, {TextTransparency = 1}):Play()
+		task.wait(0.4)
+		gui:Destroy()
+	end)()
+
+	return gui
+end
+
+-- ============================================================
+-- UPDATE CHECKER (polls GitHub every 5 seconds)
+-- ============================================================
+local UPDATE_URL     = "https://raw.githubusercontent.com/nonmex9-design/DexPlusPlus-RM-Remastered-/refs/heads/main/test.luaU"
+local _lastSourceHash = nil
+local _updateToastShown = false
+
+local function SimpleHash(str)
+	-- lightweight rolling hash for change detection
+	local h = 5381
+	for i = 1, #str do
+		h = (h * 33 + string.byte(str, i)) % 2147483647
+	end
+	return tostring(h)
+end
+
+local function StartUpdateChecker()
+	coroutine.wrap(function()
+		while true do
+			task.wait(5)
+			local ok, body = pcall(function()
+				return game:HttpGet(UPDATE_URL, true)
+			end)
+			if ok and body and #body > 0 then
+				local hash = SimpleHash(body)
+				if _lastSourceHash == nil then
+					-- first successful fetch — record as baseline
+					_lastSourceHash = hash
+				elseif hash ~= _lastSourceHash and not _updateToastShown then
+					_lastSourceHash    = hash
+					_updateToastShown  = true
+					ShowToast(
+						"🔄  Update Available!",
+						"A new version of Dex++ REMASTERED was pushed.\nRe-run the script to load it.",
+						6,
+						Color3.fromRGB(11, 148, 68)
+					)
+					-- allow showing again after 60 s so they aren't spammed
+					coroutine.wrap(function()
+						task.wait(60)
+						_updateToastShown = false
+					end)()
+				end
+			end
+		end
+	end)()
+end
+
+-- ============================================================
+-- ALREADY-OPEN DETECTION + STARTUP
+-- ============================================================
+local function GetSecureContainerEarly()
+	return (gethui and gethui())
+		or (pcall(function() game:GetService("CoreGui"):GetFullName() end) and game:GetService("CoreGui"))
+		or game:GetService("Players").LocalPlayer:FindFirstChildOfClass("PlayerGui")
+end
+
+local function IsDexAlreadyOpen()
+	local container = GetSecureContainerEarly()
+	if not container then return false end
+	for _, child in ipairs(container:GetChildren()) do
+		if string.sub(child.Name, 1, 5) == "_DPP_" and child:IsA("ScreenGui") then
+			return true
+		end
+	end
+	return false
+end
+
+local function DestroyExistingDex()
+	local container = GetSecureContainerEarly()
+	if not container then return end
+	for _, child in ipairs(container:GetChildren()) do
+		if string.sub(child.Name, 1, 5) == "_DPP_" and not child.Name:find("Toast") then
+			child:Destroy()
+		end
+	end
+end
+
+if IsDexAlreadyOpen() then
+	ShowToast(
+		"⚡  Dex already open — reloading...",
+		"Closing current session and restarting.",
+		2.5,
+		Color3.fromRGB(200, 120, 20)
+	)
+	task.wait(0.6)  -- let toast slide in before we nuke the GUI
+	DestroyExistingDex()
+	task.wait(0.3)
+end
+
+-- Start Dex
 Main.Init()
+
+-- Start update checker after Dex is loaded
+StartUpdateChecker()
 
 --for i,v in pairs(Main.MissingEnv) do print(i,v) end
