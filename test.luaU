@@ -14350,6 +14350,557 @@ else
 	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
 end
 end,
+["Executor"] = function()
+--[[
+	Executor App Module
+	A full internal script executor for Dex++ REMASTERED.
+	Supports multi-tab scripts, execution history, quick-insert snippets,
+	auto-save, and an output panel.
+]]
+
+local Main,Lib,Apps,Settings
+local Explorer, Properties, ScriptViewer, Notebook
+local API,RMD,env,service,plr,create,createSimple
+
+local function initDeps(data)
+	Main = data.Main; Lib = data.Lib; Apps = data.Apps; Settings = data.Settings
+	API = data.API; RMD = data.RMD; env = data.env; service = data.service
+	plr = data.plr; create = data.create; createSimple = data.createSimple
+end
+
+local function initAfterMain()
+	Explorer = Apps.Explorer
+	Properties = Apps.Properties
+	ScriptViewer = Apps.ScriptViewer
+	Notebook = Apps.Notebook
+end
+
+local function main()
+	local Executor = {}
+	local window
+
+	Executor.Init = function()
+		window = Lib.Window.new()
+		window:SetTitle("Executor")
+		window:Resize(620, 460)
+		Executor.Window = window
+
+		local ts = service.TweenService
+		local content = window.GuiElems.Content
+
+		-- ── Colour palette (dark monochrome) ──────────────────────────
+		local C = {
+			bg        = Color3.fromRGB(14, 14, 14),
+			panel     = Color3.fromRGB(20, 20, 20),
+			border    = Color3.fromRGB(40, 40, 40),
+			tab       = Color3.fromRGB(28, 28, 28),
+			tabActive = Color3.fromRGB(38, 38, 38),
+			btn       = Color3.fromRGB(35, 35, 35),
+			btnHov    = Color3.fromRGB(50, 50, 50),
+			btnPrs    = Color3.fromRGB(18, 18, 18),
+			execBtn   = Color3.fromRGB(38, 38, 38),
+			execHov   = Color3.fromRGB(55, 55, 55),
+			text      = Color3.fromRGB(225, 225, 225),
+			textDim   = Color3.fromRGB(130, 130, 130),
+			accent    = Color3.fromRGB(200, 200, 200),
+			success   = Color3.fromRGB(100, 210, 120),
+			error     = Color3.fromRGB(220, 80, 80),
+			warn      = Color3.fromRGB(220, 170, 60),
+		}
+
+		local function makeTI(t, s, d) return TweenInfo.new(t or 0.12, s or Enum.EasingStyle.Quint, d or Enum.EasingDirection.Out) end
+
+		local function btn(parent, text, pos, size, col, textSize)
+			local b = Instance.new("TextButton", parent)
+			b.BackgroundColor3 = col or C.btn
+			b.BorderSizePixel  = 0
+			b.AutoButtonColor  = false
+			b.Position, b.Size = pos, size
+			b.Text      = text
+			b.TextColor3 = C.text
+			b.Font       = Enum.Font.SourceSansBold
+			b.TextSize   = textSize or 13
+			b.ZIndex     = 4
+			local co = Instance.new("UICorner", b); co.CornerRadius = UDim.new(0, 4)
+			b.MouseEnter:Connect(function() ts:Create(b, makeTI(0.1), {BackgroundColor3 = C.btnHov}):Play() end)
+			b.MouseLeave:Connect(function() ts:Create(b, makeTI(0.15), {BackgroundColor3 = col or C.btn}):Play() end)
+			b.MouseButton1Down:Connect(function() ts:Create(b, makeTI(0.07), {BackgroundColor3 = C.btnPrs}):Play() end)
+			b.MouseButton1Up:Connect(function() ts:Create(b, makeTI(0.1), {BackgroundColor3 = C.btnHov}):Play() end)
+			return b
+		end
+
+		local function label(parent, text, pos, size, col, font, sz)
+			local l = Instance.new("TextLabel", parent)
+			l.BackgroundTransparency = 1
+			l.Position, l.Size = pos, size
+			l.Text = text
+			l.TextColor3 = col or C.text
+			l.Font = font or Enum.Font.SourceSans
+			l.TextSize = sz or 13
+			l.TextXAlignment = Enum.TextXAlignment.Left
+			l.ZIndex = 4
+			return l
+		end
+
+		-- ── Tab state ─────────────────────────────────────────────────
+		local tabs = {}
+		local activeTab = nil
+		local TAB_W = 110
+		local MAX_TABS = 5
+
+		-- Script history (ring buffer)
+		local history = {}
+		local MAX_HISTORY = 30
+
+		-- ── Layout frames ─────────────────────────────────────────────
+		-- Tab bar (top strip)
+		local tabBar = Instance.new("Frame", content)
+		tabBar.BackgroundColor3 = C.bg
+		tabBar.BorderSizePixel  = 0
+		tabBar.Position = UDim2.new(0, 0, 0, 0)
+		tabBar.Size     = UDim2.new(1, -150, 0, 26)
+		tabBar.ZIndex   = 3
+		local tabList = Instance.new("UIListLayout", tabBar)
+		tabList.FillDirection = Enum.FillDirection.Horizontal
+		tabList.SortOrder = Enum.SortOrder.LayoutOrder
+
+		-- Top-right controls
+		local topRight = Instance.new("Frame", content)
+		topRight.BackgroundColor3 = C.bg
+		topRight.BorderSizePixel  = 0
+		topRight.Position = UDim2.new(1, -150, 0, 0)
+		topRight.Size     = UDim2.new(0, 150, 0, 26)
+		topRight.ZIndex   = 3
+
+		local addTabBtn = btn(topRight, "+  New Tab", UDim2.new(0, 2, 0, 3), UDim2.new(0, 72, 0, 20))
+		addTabBtn.TextSize = 12
+
+		local clearTabsBtn = btn(topRight, "Clear All", UDim2.new(0, 76, 0, 3), UDim2.new(0, 70, 0, 20))
+		clearTabsBtn.TextSize = 12
+
+		-- Divider
+		local div1 = Instance.new("Frame", content)
+		div1.BackgroundColor3 = C.border
+		div1.BorderSizePixel  = 0
+		div1.Position = UDim2.new(0, 0, 0, 26)
+		div1.Size     = UDim2.new(1, 0, 0, 1)
+		div1.ZIndex   = 3
+
+		-- Code editor area (center) + right sidebar
+		local editorArea = Instance.new("Frame", content)
+		editorArea.BackgroundColor3 = C.bg
+		editorArea.BorderSizePixel  = 0
+		editorArea.Position = UDim2.new(0, 0, 0, 27)
+		editorArea.Size     = UDim2.new(1, -160, 1, -80)
+		editorArea.ZIndex   = 2
+		editorArea.ClipsDescendants = true
+
+		-- Sidebar (right)
+		local sidebar = Instance.new("Frame", content)
+		sidebar.BackgroundColor3 = C.panel
+		sidebar.BorderSizePixel  = 0
+		sidebar.Position = UDim2.new(1, -158, 0, 27)
+		sidebar.Size     = UDim2.new(0, 158, 1, -80)
+		sidebar.ZIndex   = 3
+		Instance.new("UIStroke", sidebar).Color = C.border
+
+		local sideDiv = Instance.new("Frame", content)
+		sideDiv.BackgroundColor3 = C.border
+		sideDiv.BorderSizePixel  = 0
+		sideDiv.Position = UDim2.new(1, -159, 0, 27)
+		sideDiv.Size     = UDim2.new(0, 1, 1, -80)
+		sideDiv.ZIndex   = 4
+
+		-- Bottom bar
+		local bottomBar = Instance.new("Frame", content)
+		bottomBar.BackgroundColor3 = C.panel
+		bottomBar.BorderSizePixel  = 0
+		bottomBar.Position = UDim2.new(0, 0, 1, -53)
+		bottomBar.Size     = UDim2.new(1, 0, 0, 53)
+		bottomBar.ZIndex   = 4
+		local bDiv = Instance.new("Frame", bottomBar)
+		bDiv.BackgroundColor3 = C.border
+		bDiv.BorderSizePixel  = 0
+		bDiv.Size = UDim2.new(1, 0, 0, 1)
+		bDiv.ZIndex = 5
+
+		-- ── Bottom buttons ────────────────────────────────────────────
+		local executeBtn = btn(bottomBar, "▶  Execute", UDim2.new(0, 6, 0, 7), UDim2.new(0, 100, 0, 30), Color3.fromRGB(38,38,38), 14)
+		local stroke = Instance.new("UIStroke", executeBtn)
+		stroke.Color = Color3.fromRGB(80,80,80); stroke.Thickness = 1; stroke.Transparency = 0.4
+
+		local clearBtn  = btn(bottomBar, "🗑 Clear",   UDim2.new(0, 112, 0, 7), UDim2.new(0, 78, 0, 30), C.btn, 13)
+		local saveBtn   = btn(bottomBar, "💾 Save",    UDim2.new(0, 196, 0, 7), UDim2.new(0, 68, 0, 30), C.btn, 13)
+		local copyBtn   = btn(bottomBar, "📋 Copy",    UDim2.new(0, 270, 0, 7), UDim2.new(0, 68, 0, 30), C.btn, 13)
+		local openBtn   = btn(bottomBar, "📂 Open",    UDim2.new(0, 344, 0, 7), UDim2.new(0, 68, 0, 30), C.btn, 13)
+
+		-- Status label
+		local statusLabel = label(bottomBar, "", UDim2.new(0, 418, 0, 14), UDim2.new(1, -424, 0, 20), C.textDim, Enum.Font.SourceSans, 12)
+
+		local function setStatus(msg, col, duration)
+			statusLabel.Text = msg
+			statusLabel.TextColor3 = col or C.textDim
+			if duration then
+				task.delay(duration, function()
+					if statusLabel.Text == msg then
+						statusLabel.Text = ""
+					end
+				end)
+			end
+		end
+
+		-- ── Code frame holder (per tab) ───────────────────────────────
+		local codeFrames = {}
+		local tabButtons = {}
+
+		local function getActiveCode()
+			if activeTab and codeFrames[activeTab] then
+				return codeFrames[activeTab]:GetText()
+			end
+			return ""
+		end
+
+		local function setActiveCode(text)
+			if activeTab and codeFrames[activeTab] then
+				codeFrames[activeTab]:SetText(text)
+			end
+		end
+
+		local function switchTab(id)
+			if activeTab == id then return end
+			-- hide old
+			if activeTab and codeFrames[activeTab] then
+				codeFrames[activeTab].Frame.Visible = false
+			end
+			if activeTab and tabButtons[activeTab] then
+				ts:Create(tabButtons[activeTab], makeTI(0.1), {BackgroundColor3 = C.tab}):Play()
+				tabButtons[activeTab].TextColor3 = C.textDim
+			end
+			-- show new
+			activeTab = id
+			if codeFrames[id] then
+				codeFrames[id].Frame.Visible = true
+			end
+			if tabButtons[id] then
+				ts:Create(tabButtons[id], makeTI(0.1), {BackgroundColor3 = C.tabActive}):Play()
+				tabButtons[id].TextColor3 = C.text
+			end
+		end
+
+		local tabCount = 0
+		local function newTab(initialText)
+			tabCount = tabCount + 1
+			local id = tabCount
+			local name = "Script " .. id
+
+			-- Tab button
+			local tabBtn = Instance.new("TextButton", tabBar)
+			tabBtn.BackgroundColor3 = C.tab
+			tabBtn.BorderSizePixel  = 0
+			tabBtn.AutoButtonColor  = false
+			tabBtn.Size     = UDim2.new(0, TAB_W, 1, 0)
+			tabBtn.Text     = name
+			tabBtn.TextColor3 = C.textDim
+			tabBtn.Font      = Enum.Font.SourceSans
+			tabBtn.TextSize  = 12
+			tabBtn.ZIndex    = 4
+			tabBtn.LayoutOrder = id
+			local tc = Instance.new("UICorner", tabBtn); tc.CornerRadius = UDim.new(0, 4)
+			local tp = Instance.new("UIPadding", tabBtn)
+			tp.PaddingLeft = UDim.new(0, 6); tp.PaddingRight = UDim.new(0, 18)
+
+			-- Close X on tab
+			local closeX = Instance.new("TextButton", tabBtn)
+			closeX.BackgroundTransparency = 1
+			closeX.Position = UDim2.new(1, -16, 0, 4)
+			closeX.Size     = UDim2.new(0, 14, 0, 14)
+			closeX.Text     = "×"
+			closeX.TextColor3 = C.textDim
+			closeX.Font      = Enum.Font.SourceSansBold
+			closeX.TextSize  = 14
+			closeX.ZIndex    = 6
+			closeX.AutoButtonColor = false
+			closeX.MouseEnter:Connect(function() closeX.TextColor3 = C.error end)
+			closeX.MouseLeave:Connect(function() closeX.TextColor3 = C.textDim end)
+
+			-- Code frame for this tab
+			local cf = Lib.CodeFrame.new()
+			cf.Frame.Position = UDim2.new(0, 0, 0, 0)
+			cf.Frame.Size     = UDim2.new(1, 0, 1, 0)
+			cf.Frame.Parent   = editorArea
+			cf.Frame.Visible  = false
+			if initialText then cf:SetText(initialText) end
+
+			codeFrames[id]  = cf
+			tabButtons[id]  = tabBtn
+			tabs[id]        = {id=id, name=name, btn=tabBtn}
+
+			tabBtn.MouseButton1Click:Connect(function()
+				switchTab(id)
+			end)
+
+			closeX.MouseButton1Click:Connect(function()
+				-- Remove tab
+				tabBtn:Destroy()
+				cf.Frame:Destroy()
+				codeFrames[id] = nil
+				tabButtons[id] = nil
+				tabs[id]       = nil
+				-- Switch to another tab
+				if activeTab == id then
+					activeTab = nil
+					for tid, _ in pairs(tabs) do
+						switchTab(tid)
+						break
+					end
+				end
+			end)
+
+			switchTab(id)
+			return id
+		end
+
+		-- Create first tab
+		newTab("-- Dex++ REMASTERED — Executor\n-- Type or paste your script here\n\n")
+
+		addTabBtn.MouseButton1Click:Connect(function()
+			newTab()
+		end)
+
+		clearTabsBtn.MouseButton1Click:Connect(function()
+			-- Remove all tabs
+			for id, t in pairs(tabs) do
+				if tabButtons[id] then tabButtons[id]:Destroy() end
+				if codeFrames[id] then codeFrames[id].Frame:Destroy() end
+				codeFrames[id] = nil; tabButtons[id] = nil; tabs[id] = nil
+			end
+			activeTab = nil
+			tabCount = 0
+			newTab("-- Dex++ REMASTERED — Executor\n\n")
+		end)
+
+		-- ── Execute ───────────────────────────────────────────────────
+		executeBtn.MouseButton1Click:Connect(function()
+			local src = getActiveCode()
+			if src == "" then setStatus("Nothing to execute.", C.warn, 3) return end
+
+			-- Save to history
+			table.insert(history, 1, {time = os.date("%H:%M:%S"), src = src})
+			if #history > MAX_HISTORY then table.remove(history, #history) end
+
+			if not env.loadstring then
+				setStatus("⚠  loadstring not available in this executor.", C.error, 4)
+				return
+			end
+			local fn, err = env.loadstring(src)
+			if not fn then
+				setStatus("⛔ Compile error: " .. tostring(err), C.error, 6)
+				return
+			end
+			setStatus("▶  Running...", C.textDim)
+			local ok, runErr = pcall(fn)
+			if ok then
+				setStatus("✓  Executed successfully.", C.success, 4)
+			else
+				setStatus("⛔ " .. tostring(runErr), C.error, 6)
+			end
+		end)
+
+		clearBtn.MouseButton1Click:Connect(function()
+			setActiveCode("")
+			setStatus("Cleared.", C.textDim, 2)
+		end)
+
+		copyBtn.MouseButton1Click:Connect(function()
+			if env.setclipboard then
+				env.setclipboard(getActiveCode())
+				setStatus("✓  Copied to clipboard.", C.success, 3)
+			else
+				setStatus("⚠  setclipboard not available.", C.warn, 3)
+			end
+		end)
+
+		saveBtn.MouseButton1Click:Connect(function()
+			local src = getActiveCode()
+			local fname = "Executor_" .. os.date("%d-%m-%Y_%H-%M-%S") .. ".lua"
+			Lib.SaveAsPrompt(fname, src)
+		end)
+
+		openBtn.MouseButton1Click:Connect(function()
+			if not env.readfile then setStatus("⚠  readfile not available.", C.warn, 3) return end
+			-- basic: try to open a file from the exploits folder
+			if env.listfiles then
+				local ok, files = pcall(env.listfiles, "")
+				if ok and #files > 0 then
+					local ctx = Lib.ContextMenu.new()
+					ctx.MaxHeight = 220
+					ctx.Iconless = true
+					for _, f in ipairs(files) do
+						if f:match("%.lua$") or f:match("%.txt$") then
+							ctx:Add({Name = f, OnClick = function()
+								local s, data = pcall(env.readfile, f)
+								if s then
+									newTab(data)
+									setStatus("Opened: " .. f, C.success, 3)
+								end
+							end})
+						end
+					end
+					ctx:Show()
+					return
+				end
+			end
+			setStatus("⚠  No files found or listfiles unavailable.", C.warn, 3)
+		end)
+
+		-- ── Sidebar: Quick Scripts ─────────────────────────────────────
+		local sideTitle = label(sidebar, "  Quick Scripts", UDim2.new(0,0,0,0), UDim2.new(1,0,0,22), C.textDim, Enum.Font.SourceSansBold, 12)
+		sideTitle.TextYAlignment = Enum.TextYAlignment.Center
+
+		local sideDivTop = Instance.new("Frame", sidebar)
+		sideDivTop.BackgroundColor3 = C.border
+		sideDivTop.BorderSizePixel = 0
+		sideDivTop.Position = UDim2.new(0,0,0,22); sideDivTop.Size = UDim2.new(1,0,0,1)
+
+		local snippets = {
+			{"Print All Players",    'for _,p in pairs(game:GetService("Players"):GetPlayers()) do print(p.Name) end'},
+			{"Get LocalPlayer",      'print(game:GetService("Players").LocalPlayer.Name)'},
+			{"Print Mouse Target",   'print(game:GetService("Players").LocalPlayer:GetMouse().Target)'},
+			{"Destroy All Parts",    'for _,v in pairs(workspace:GetDescendants()) do if v:IsA("BasePart") then v:Destroy() end end'},
+			{"Infinite Jump",        'game:GetService("UserInputService").JumpRequest:Connect(function()\n  game:GetService("Players").LocalPlayer.Character:FindFirstChildOfClass("Humanoid"):ChangeState("Jumping")\nend)'},
+			{"Teleport to 0,0,0",    'game:GetService("Players").LocalPlayer.Character.HumanoidRootPart.CFrame = CFrame.new(0,10,0)'},
+			{"Print FPS",            'print(math.floor(1/game:GetService("RunService").Heartbeat:Wait()))'},
+			{"Full Bright",          'game:GetService("Lighting").Brightness = 10\ngame:GetService("Lighting").ClockTime = 14'},
+			{"List RemoteEvents",    'for _,v in pairs(game:GetDescendants()) do if v:IsA("RemoteEvent") then print(v:GetFullName()) end end'},
+			{"List Scripts",         'for _,v in pairs(game:GetDescendants()) do if v:IsA("LocalScript") or v:IsA("Script") or v:IsA("ModuleScript") then print(v:GetFullName()) end end'},
+			{"Speed Hack x3",        'game:GetService("Players").LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = 48'},
+			{"WalkSpeed Reset",      'game:GetService("Players").LocalPlayer.Character:FindFirstChildOfClass("Humanoid").WalkSpeed = 16'},
+		}
+
+		local snippetScroll = Instance.new("ScrollingFrame", sidebar)
+		snippetScroll.BackgroundTransparency = 1
+		snippetScroll.BorderSizePixel = 0
+		snippetScroll.Position = UDim2.new(0,0,0,24)
+		snippetScroll.Size     = UDim2.new(1,0,0.6,-24)
+		snippetScroll.ScrollBarThickness = 3
+		snippetScroll.ScrollBarImageColor3 = Color3.fromRGB(80,80,80)
+		snippetScroll.CanvasSize = UDim2.new(0,0,0,0)
+		snippetScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		snippetScroll.ZIndex = 4
+
+		local snippetLayout = Instance.new("UIListLayout", snippetScroll)
+		snippetLayout.Padding = UDim.new(0,2)
+		local snippetPad = Instance.new("UIPadding", snippetScroll)
+		snippetPad.PaddingLeft = UDim.new(0,4); snippetPad.PaddingRight = UDim.new(0,4); snippetPad.PaddingTop = UDim.new(0,4)
+
+		for _, snip in ipairs(snippets) do
+			local sBtn = Instance.new("TextButton", snippetScroll)
+			sBtn.BackgroundColor3 = Color3.fromRGB(28,28,28)
+			sBtn.BorderSizePixel  = 0
+			sBtn.AutoButtonColor  = false
+			sBtn.Size = UDim2.new(1, 0, 0, 26)
+			sBtn.Text = snip[1]
+			sBtn.TextColor3 = Color3.fromRGB(195,195,195)
+			sBtn.Font = Enum.Font.SourceSans
+			sBtn.TextSize = 12
+			sBtn.TextXAlignment = Enum.TextXAlignment.Left
+			sBtn.ZIndex = 5
+			local sp = Instance.new("UIPadding", sBtn); sp.PaddingLeft = UDim.new(0,6)
+			local sc = Instance.new("UICorner", sBtn); sc.CornerRadius = UDim.new(0,4)
+			sBtn.MouseEnter:Connect(function() ts:Create(sBtn, makeTI(0.1), {BackgroundColor3 = Color3.fromRGB(42,42,42)}):Play() end)
+			sBtn.MouseLeave:Connect(function() ts:Create(sBtn, makeTI(0.15), {BackgroundColor3 = Color3.fromRGB(28,28,28)}):Play() end)
+			sBtn.MouseButton1Click:Connect(function()
+				-- Append to current tab with a newline separator
+				local current = getActiveCode()
+				if current ~= "" and current:sub(-1) ~= "\n" then current = current .. "\n" end
+				setActiveCode(current .. snip[2])
+				setStatus("Inserted: " .. snip[1], C.success, 2)
+			end)
+			sBtn.MouseButton2Click:Connect(function()
+				-- Right click: run directly
+				if env.loadstring then
+					local fn, err = env.loadstring(snip[2])
+					if fn then
+						local ok, re = pcall(fn)
+						setStatus(ok and ("✓ " .. snip[1]) or ("⛔ " .. tostring(re)), ok and C.success or C.error, 4)
+					else
+						setStatus("⛔ " .. tostring(err), C.error, 4)
+					end
+				end
+			end)
+		end
+
+		-- ── Sidebar: History ──────────────────────────────────────────
+		local histDivider = Instance.new("Frame", sidebar)
+		histDivider.BackgroundColor3 = C.border
+		histDivider.BorderSizePixel  = 0
+		histDivider.Position = UDim2.new(0,0,0.6,0); histDivider.Size = UDim2.new(1,0,0,1); histDivider.ZIndex = 4
+
+		local histTitle = label(sidebar, "  History", UDim2.new(0,0,0.6,2), UDim2.new(1,0,0,18), C.textDim, Enum.Font.SourceSansBold, 12)
+		histTitle.ZIndex = 5
+
+		local histScroll = Instance.new("ScrollingFrame", sidebar)
+		histScroll.BackgroundTransparency = 1
+		histScroll.BorderSizePixel = 0
+		histScroll.Position = UDim2.new(0,0,0.6,21)
+		histScroll.Size     = UDim2.new(1,0,0.4,-21)
+		histScroll.ScrollBarThickness = 3
+		histScroll.ScrollBarImageColor3 = Color3.fromRGB(80,80,80)
+		histScroll.CanvasSize = UDim2.new(0,0,0,0)
+		histScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		histScroll.ZIndex = 4
+
+		local histLayout = Instance.new("UIListLayout", histScroll)
+		histLayout.Padding = UDim.new(0,2)
+		local histPad = Instance.new("UIPadding", histScroll)
+		histPad.PaddingLeft = UDim.new(0,4); histPad.PaddingRight = UDim.new(0,4); histPad.PaddingTop = UDim.new(0,3)
+
+		local function refreshHistory()
+			for _, c in ipairs(histScroll:GetChildren()) do
+				if not c:IsA("UIListLayout") and not c:IsA("UIPadding") then c:Destroy() end
+			end
+			for i, h in ipairs(history) do
+				local hBtn = Instance.new("TextButton", histScroll)
+				hBtn.BackgroundColor3 = Color3.fromRGB(25,25,25)
+				hBtn.BorderSizePixel  = 0
+				hBtn.AutoButtonColor  = false
+				hBtn.Size = UDim2.new(1,0,0,22)
+				local preview = h.src:match("([^\n]+)") or ""
+				if #preview > 18 then preview = preview:sub(1,18) .. "…" end
+				hBtn.Text = h.time .. "  " .. preview
+				hBtn.TextColor3 = Color3.fromRGB(170,170,170)
+				hBtn.Font = Enum.Font.Code
+				hBtn.TextSize = 11
+				hBtn.TextXAlignment = Enum.TextXAlignment.Left
+				hBtn.ZIndex = 5
+				local hp = Instance.new("UIPadding", hBtn); hp.PaddingLeft = UDim.new(0,5)
+				local hc = Instance.new("UICorner", hBtn); hc.CornerRadius = UDim.new(0,3)
+				hBtn.MouseEnter:Connect(function() ts:Create(hBtn, makeTI(0.1), {BackgroundColor3 = Color3.fromRGB(40,40,40)}):Play() end)
+				hBtn.MouseLeave:Connect(function() ts:Create(hBtn, makeTI(0.15), {BackgroundColor3 = Color3.fromRGB(25,25,25)}):Play() end)
+				hBtn.MouseButton1Click:Connect(function()
+					-- Load into new tab
+					newTab(h.src)
+					setStatus("Loaded from history.", C.success, 2)
+				end)
+			end
+		end
+
+		-- Hook execute to also refresh history display
+		local origExecute = executeBtn.MouseButton1Click
+		executeBtn.MouseButton1Click:Connect(function()
+			task.defer(refreshHistory)
+		end)
+	end
+
+	return Executor
+end
+
+if gethsfuncs then
+	_G.moduleData = {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+else
+	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+end
+end,
 }
 local oldgame = oldgame or game
 
@@ -14389,7 +14940,7 @@ end
 local isFsSupported = readfile and writefile and isfile and isfolder and listfiles and delfile and delfolder
 
 -- Main vars
-local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
+local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, Executor--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
 local API, RMD
 
 -- Default Settings
@@ -14422,38 +14973,38 @@ DefaultSettings = (function()
 		},
 		Theme = {
 			_Recurse = true,
-			Main1 = rgb(52,52,52),
-			Main2 = rgb(45,45,45),
-			Outline1 = rgb(33,33,33), -- Mainly frames
-			Outline2 = rgb(55,55,55), -- Mainly button
-			Outline3 = rgb(30,30,30), -- Mainly textbox
-			TextBox = rgb(38,38,38),
-			Menu = rgb(32,32,32),
-			ListSelection = rgb(11,90,175),
-			Button = rgb(60,60,60),
-			ButtonHover = rgb(68,68,68),
-			ButtonPress = rgb(40,40,40),
-			Highlight = rgb(75,75,75),
-			Text = rgb(255,255,255),
-			PlaceholderText = rgb(100,100,100),
-			Important = rgb(255,0,0),
+			Main1 = rgb(22,22,22),
+			Main2 = rgb(18,18,18),
+			Outline1 = rgb(35,35,35), -- Mainly frames
+			Outline2 = rgb(48,48,48), -- Mainly button
+			Outline3 = rgb(28,28,28), -- Mainly textbox
+			TextBox = rgb(28,28,28),
+			Menu = rgb(15,15,15),
+			ListSelection = rgb(60,60,60),
+			Button = rgb(38,38,38),
+			ButtonHover = rgb(52,52,52),
+			ButtonPress = rgb(22,22,22),
+			Highlight = rgb(65,65,65),
+			Text = rgb(230,230,230),
+			PlaceholderText = rgb(90,90,90),
+			Important = rgb(220,60,60),
 			ExplorerIconMap = "",
 			MiscIconMap = "",
 			Syntax = {
 				Text = rgb(204,204,204),
-				Background = rgb(36,36,36),
+				Background = rgb(16,16,16),
 				Selection = rgb(255,255,255),
-				SelectionBack = rgb(11,90,175),
-				Operator = rgb(204,204,204),
+				SelectionBack = rgb(60,60,60),
+				Operator = rgb(180,180,180),
 				Number = rgb(255,198,0),
 				String = rgb(173,241,149),
-				Comment = rgb(102,102,102),
+				Comment = rgb(90,90,90),
 				Keyword = rgb(248,109,124),
-				Error = rgb(255,0,0),
-				FindBackground = rgb(141,118,0),
-				MatchingWord = rgb(85,85,85),
+				Error = rgb(255,70,70),
+				FindBackground = rgb(100,85,0),
+				MatchingWord = rgb(70,70,70),
 				BuiltIn = rgb(132,214,247),
-				CurrentLine = rgb(45,50,65),
+				CurrentLine = rgb(32,32,32),
 				LocalMethod = rgb(253,251,172),
 				LocalProperty = rgb(97,161,241),
 				Nil = rgb(255,198,0),
@@ -14462,7 +15013,7 @@ DefaultSettings = (function()
 				Local = rgb(248,109,124),
 				Self = rgb(248,109,124),
 				FunctionName = rgb(253,251,172),
-				Bracket = rgb(204,204,204)
+				Bracket = rgb(180,180,180)
 			},
 		},
 		ScriptViewer = {
@@ -14528,7 +15079,7 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Executor"}
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -14785,6 +15336,7 @@ Main = (function()
 		ModelViewer = Apps.ModelViewer
 		Notebook = Apps.Notebook
 		SettingsWindow = Apps.SettingsWindow
+		Executor = Apps.Executor
 		
 		
 		--SecretServicePanel = Apps.SecretServicePanel
@@ -14796,7 +15348,8 @@ Main = (function()
 			SaveInstance = SaveInstance,
 			ModelViewer = ModelViewer,
 			Notebook = Notebook,
-			SettingsWindow = SettingsWindow
+			SettingsWindow = SettingsWindow,
+			Executor = Executor
 			--SecretServicePanel = SecretServicePanel,
 		}
 		
@@ -15725,7 +16278,7 @@ Main = (function()
 
 		Main.MainGui.OpenButton.Text = val and "Close" or "Dex++ RM"
 		if val then Main.MainGui.OpenButton.MainFrame.Visible = true end
-		Main.MainGui.OpenButton.MainFrame:TweenSize(val and UDim2.new(0,224,0,200) or UDim2.new(0,0,0,0),Enum.EasingDirection.Out,Enum.EasingStyle.Quint,0.25,true)
+		Main.MainGui.OpenButton.MainFrame:TweenSize(val and UDim2.new(0,296,0,240) or UDim2.new(0,0,0,0),Enum.EasingDirection.Out,Enum.EasingStyle.Quint,0.25,true)
 		service.TweenService:Create(Main.MainGui.OpenButton,TweenInfo.new(0.2,Enum.EasingStyle.Quint,Enum.EasingDirection.Out),{BackgroundTransparency = val and 0 or (Lib.CheckMouseInGui(Main.MainGui.OpenButton) and 0 or 0.2)}):Play()
 
 		if Main.MainGuiMouseEvent then Main.MainGuiMouseEvent:Disconnect() end
@@ -15750,31 +16303,32 @@ Main = (function()
 	Main.CreateMainGui = function()
 		local gui = create({
 			{1,"ScreenGui",{IgnoreGuiInset=true,Name="MainMenu",}},
-			{2,"TextButton",{AnchorPoint=Vector2.new(0.5,0),AutoButtonColor=false,BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),BorderSizePixel=0,Font=4,Name="OpenButton",Parent={1},Position=UDim2.new(0.5,0,0,2),Size=UDim2.new(0,75,0,32),Text="Dex++ RM",TextColor3=Color3.new(1,1,1),TextSize=15,TextTransparency=0.20000000298023,}},
-			{3,"UICorner",{CornerRadius=UDim.new(0,4),Parent={2},}},
-			{4,"Frame",{AnchorPoint=Vector2.new(0.5,0),BackgroundColor3=Color3.new(0.17647059261799,0.17647059261799,0.17647059261799),ClipsDescendants=true,Name="MainFrame",Parent={2},Position=UDim2.new(0.5,0,1,-4),Size=UDim2.new(0,224,0,200),}},
-			{5,"UICorner",{CornerRadius=UDim.new(0,4),Parent={4},}},
-			{6,"Frame",{BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),Name="BottomFrame",Parent={4},Position=UDim2.new(0,0,1,-24),Size=UDim2.new(1,0,0,24),}},
-			{7,"UICorner",{CornerRadius=UDim.new(0,4),Parent={6},}},
-			{8,"Frame",{BackgroundColor3=Color3.new(0.20392157137394,0.20392157137394,0.20392157137394),BorderSizePixel=0,Name="CoverFrame",Parent={6},Size=UDim2.new(1,0,0,4),}},
-			{9,"Frame",{BackgroundColor3=Color3.new(0.1294117718935,0.1294117718935,0.1294117718935),BorderSizePixel=0,Name="Line",Parent={8},Position=UDim2.new(0,0,0,-1),Size=UDim2.new(1,0,0,1),}},
+			{2,"TextButton",{AnchorPoint=Vector2.new(0.5,0),AutoButtonColor=false,BackgroundColor3=Color3.new(0.10,0.10,0.10),BorderSizePixel=0,Font=4,Name="OpenButton",Parent={1},Position=UDim2.new(0.5,0,0,2),Size=UDim2.new(0,84,0,30),Text="Dex++ RM",TextColor3=Color3.new(0.9,0.9,0.9),TextSize=14,TextTransparency=0.10,}},
+			{3,"UICorner",{CornerRadius=UDim.new(0,5),Parent={2},}},
+			{4,"Frame",{AnchorPoint=Vector2.new(0.5,0),BackgroundColor3=Color3.new(0.10,0.10,0.10),ClipsDescendants=true,Name="MainFrame",Parent={2},Position=UDim2.new(0.5,0,1,-4),Size=UDim2.new(0,296,0,240),}},
+			{5,"UICorner",{CornerRadius=UDim.new(0,5),Parent={4},}},
+			{6,"Frame",{BackgroundColor3=Color3.new(0.12,0.12,0.12),Name="BottomFrame",Parent={4},Position=UDim2.new(0,0,1,-26),Size=UDim2.new(1,0,0,26),}},
+			{7,"UICorner",{CornerRadius=UDim.new(0,5),Parent={6},}},
+			{8,"Frame",{BackgroundColor3=Color3.new(0.12,0.12,0.12),BorderSizePixel=0,Name="CoverFrame",Parent={6},Size=UDim2.new(1,0,0,4),}},
+			{9,"Frame",{BackgroundColor3=Color3.new(0.08,0.08,0.08),BorderSizePixel=0,Name="Line",Parent={8},Position=UDim2.new(0,0,0,-1),Size=UDim2.new(1,0,0,1),}},
 			{10,"TextButton",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Settings",Parent={6},Position=UDim2.new(1,-48,0,0),Size=UDim2.new(0,24,1,0),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,}},
 			{11,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://6578871732",ImageTransparency=0.20000000298023,Name="Icon",Parent={10},Position=UDim2.new(0,4,0,4),Size=UDim2.new(0,16,0,16),}},
 			{12,"TextButton",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Font=3,Name="Information",Parent={6},Position=UDim2.new(1,-24,0,0),Size=UDim2.new(0,24,1,0),Text="",TextColor3=Color3.new(1,1,1),TextSize=14,}},
 			{13,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://6578933307",ImageTransparency=0.20000000298023,Name="Icon",Parent={12},Position=UDim2.new(0,4,0,4),Size=UDim2.new(0,16,0,16),}},
-			{14,"ScrollingFrame",{Active=true,AnchorPoint=Vector2.new(0.5,0),BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,BorderColor3=Color3.new(0.1294117718935,0.1294117718935,0.1294117718935),BorderSizePixel=0,Name="AppsFrame",Parent={4},Position=UDim2.new(0.5,0,0,0),ScrollBarImageColor3=Color3.new(0,0,0),ScrollBarThickness=4,Size=UDim2.new(0,222,1,-25),}},
-			{15,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Name="Container",Parent={14},Position=UDim2.new(0,7,0,8),Size=UDim2.new(1,-14,0,2),}},
-			{16,"UIGridLayout",{CellSize=UDim2.new(0,66,0,74),Parent={15},SortOrder=2,}},
+			{14,"ScrollingFrame",{Active=true,AnchorPoint=Vector2.new(0.5,0),BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,BorderColor3=Color3.new(0.08,0.08,0.08),BorderSizePixel=0,Name="AppsFrame",Parent={4},Position=UDim2.new(0.5,0,0,0),ScrollBarImageColor3=Color3.new(0.3,0.3,0.3),ScrollBarThickness=4,Size=UDim2.new(0,294,1,-27),}},
+			{15,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Name="Container",Parent={14},Position=UDim2.new(0,6,0,6),Size=UDim2.new(1,-12,0,2),}},
+			{16,"UIGridLayout",{CellSize=UDim2.new(0,66,0,72),Parent={15},SortOrder=2,}},
 			{17,"Frame",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Name="App",Parent={1},Size=UDim2.new(0,100,0,100),Visible=false,}},
-			{18,"TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.new(0.2352941185236,0.2352941185236,0.2352941185236),BorderSizePixel=0,Font=3,Name="Main",Parent={17},Size=UDim2.new(1,0,0,60),Text="",TextColor3=Color3.new(0,0,0),TextSize=14,}},
+			{18,"TextButton",{AutoButtonColor=false,BackgroundColor3=Color3.new(0.14,0.14,0.14),BorderSizePixel=0,Font=3,Name="Main",Parent={17},Size=UDim2.new(1,0,0,60),Text="",TextColor3=Color3.new(0,0,0),TextSize=14,}},
 			{19,"ImageLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,Image="rbxassetid://129589545519436",ImageRectSize=Vector2.new(32,32),Name="Icon",Parent={18},Position=UDim2.new(0.5,-16,0,4),ScaleType=4,Size=UDim2.new(0,32,0,32),}},
-			{20,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,BorderSizePixel=0,Font=3,Name="AppName",Parent={18},Position=UDim2.new(0,2,0,38),Size=UDim2.new(1,-4,1,-40),Text="Explorer",TextColor3=Color3.new(1,1,1),TextSize=14,TextTransparency=0.10000000149012,TextTruncate=1,TextWrapped=true,TextYAlignment=0,}},
-			{21,"Frame",{BackgroundColor3=Color3.new(0,0.66666668653488,1),BorderSizePixel=0,Name="Highlight",Parent={18},Position=UDim2.new(0,0,1,-2),Size=UDim2.new(1,0,0,2),}},
+			{20,"TextLabel",{BackgroundColor3=Color3.new(1,1,1),BackgroundTransparency=1,BorderSizePixel=0,Font=3,Name="AppName",Parent={18},Position=UDim2.new(0,2,0,38),Size=UDim2.new(1,-4,1,-40),Text="Explorer",TextColor3=Color3.new(0.88,0.88,0.88),TextSize=13,TextTransparency=0.10000000149012,TextTruncate=1,TextWrapped=true,TextYAlignment=0,}},
+			{21,"Frame",{BackgroundColor3=Color3.new(0.85,0.85,0.85),BorderSizePixel=0,Name="Highlight",Parent={18},Position=UDim2.new(0,0,1,-2),Size=UDim2.new(1,0,0,2),}},
 		})
 		Main.MainGui = gui
 		Main.AppsFrame = gui.OpenButton.MainFrame.AppsFrame
 		Main.AppsContainer = Main.AppsFrame.Container
 		Main.AppsContainerGrid = Main.AppsContainer.UIGridLayout
+		Main.AppsContainerGrid.CellPadding = UDim2.new(0, 4, 0, 4)
 		Main.AppTemplate = gui.App
 		Main.MainGuiOpen = false
 
@@ -15850,12 +16404,11 @@ Main = (function()
 		end)
 
 		-- Create Main Apps
-		Main.CreateApp({Name = "Explorer", IconMap = Main.LargeIcons, Icon = "Explorer", Open = true, Window = Explorer.Window})
-
-		Main.CreateApp({Name = "Properties", IconMap = Main.LargeIcons, Icon = "Properties", Open = true, Window = Properties.Window})
+		Main.CreateApp({Name = "Explorer",       IconMap = Main.LargeIcons, Icon = "Explorer",       Open = true, Window = Explorer.Window})
+		Main.CreateApp({Name = "Properties",     IconMap = Main.LargeIcons, Icon = "Properties",     Open = true, Window = Properties.Window})
 
 		local cptsOnMouseClick = nil
-		Main.CreateApp({Name = "Click part to select", IconMap = Explorer.ClassIcons, Icon = "SelectionBox", OnClick = function(callback)
+		Main.CreateApp({Name = "Click to Select", IconMap = Explorer.ClassIcons, Icon = "SelectionBox", OnClick = function(callback)
 			if callback then
 				local mouse = Main.Mouse
 				cptsOnMouseClick = mouse.Button1Down:Connect(function()
@@ -15870,15 +16423,37 @@ Main = (function()
 			else if cptsOnMouseClick ~= nil then cptsOnMouseClick:Disconnect() cptsOnMouseClick = nil end end
 		end})
 
-		Main.CreateApp({Name = "Notepad", IconMap = Main.LargeIcons, Icon = "Script_Viewer", Window = ScriptViewer.Window})
-		
-		Main.CreateApp({Name = "Console", IconMap = Main.LargeIcons, Icon = "Executor", Window = Console.Window})
-		
-		Main.CreateApp({Name = "Save Instance", IconMap = Main.LargeIcons, Icon = "Book", Window = SaveInstance.Window})
-		
-		Main.CreateApp({Name = "3D Viewer", IconMap = Main.LargeIcons, Icon = "Object", Window = ModelViewer.Window})
+		Main.CreateApp({Name = "Executor",       IconMap = Main.LargeIcons, Icon = "ScriptEdit",     Window = Executor.Window})
+		Main.CreateApp({Name = "Notepad",        IconMap = Main.LargeIcons, Icon = "Script_Viewer",  Window = ScriptViewer.Window})
+		Main.CreateApp({Name = "Console",        IconMap = Main.LargeIcons, Icon = "Executor",       Window = Console.Window})
+		Main.CreateApp({Name = "Save Instance",  IconMap = Main.LargeIcons, Icon = "Book",           Window = SaveInstance.Window})
+		Main.CreateApp({Name = "3D Viewer",      IconMap = Main.LargeIcons, Icon = "Object",         Window = ModelViewer.Window})
 
-		--Main.CreateApp({Name = "Secret Service Panel", IconMap = Main.LargeIcons, Icon = "Output", Window = SecretServicePanel.Window})
+		-- Theme preset toggle (cycles through Dark, Midnight, Warm)
+		local themeIdx = 1
+		local themePresets = {
+			{name="Dark",     Main1=Color3.fromRGB(22,22,22),     Button=Color3.fromRGB(38,38,38),    ListSelection=Color3.fromRGB(60,60,60),  text="Dark"},
+			{name="Midnight", Main1=Color3.fromRGB(10,10,18),     Button=Color3.fromRGB(25,25,40),    ListSelection=Color3.fromRGB(50,50,80),  text="Midnight"},
+			{name="Warm",     Main1=Color3.fromRGB(20,16,12),     Button=Color3.fromRGB(42,32,22),    ListSelection=Color3.fromRGB(70,50,30),  text="Warm"},
+			{name="Slate",    Main1=Color3.fromRGB(18,22,26),     Button=Color3.fromRGB(30,38,46),    ListSelection=Color3.fromRGB(50,65,80),  text="Slate"},
+		}
+		Main.CreateApp({Name = "Theme: Dark", IconMap = Main.LargeIcons, Icon = "Watcher", OnClick = function(on)
+			if on then
+				themeIdx = (themeIdx % #themePresets) + 1
+				local p = themePresets[themeIdx]
+				Settings.Theme.Main1  = p.Main1
+				Settings.Theme.Main2  = p.Main1:lerp(Color3.fromRGB(0,0,0), 0.15)
+				Settings.Theme.Button = p.Button
+				Settings.Theme.ButtonHover = p.Button:lerp(Color3.fromRGB(1,1,1), 0.2)
+				Settings.Theme.ListSelection = p.ListSelection
+				Settings.Theme.Menu = p.Main1:lerp(Color3.fromRGB(0,0,0), 0.25)
+				Settings.Theme.TextBox = p.Main1:lerp(Color3.fromRGB(1,1,1), 0.05)
+				-- Update app name to show current theme
+				local appCtrl = Main.MenuApps["Theme: Dark"] or Main.MenuApps["Theme: Midnight"] or Main.MenuApps["Theme: Warm"] or Main.MenuApps["Theme: Slate"]
+				if appCtrl then appCtrl.Gui.Main.AppName.Text = "Theme:\n"..p.name end
+				Main.Reinit()
+			end
+		end})
 		
 		for _, loadedplugin in pairs(Main.Plugins) do
 			Main.CreateApp({Name = loadedplugin.PluginData.FriendlyName, IconMap = Explorer.ClassIcons, Icon = "Attachment", Window = loadedplugin.Window})
@@ -16007,6 +16582,7 @@ Main = (function()
 		SaveInstance.Init()
 		ModelViewer.Init()
 		SettingsWindow.Init()
+		Executor.Init()
 		--SecretServicePanel.Init()
 		
 		
