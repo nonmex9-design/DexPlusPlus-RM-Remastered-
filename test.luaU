@@ -7,7 +7,6 @@
 	Dex++ REMASTERED is an enhanced revival of Moon's Dex with improved UI,
 	smooth hover effects, additional features, and fixed decompiler support.
 ]]
--- hi
 
 local selection
 local nodes = {}
@@ -14902,6 +14901,729 @@ else
 	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
 end
 end,
+["RemoteSpy"] = function()
+--[[
+	RemoteSpy App Module — Dex++ REMASTERED
+	Supports Xeno (no hookmetamethod) via hookfunction fallback.
+	Detects outgoing: FireServer, InvokeServer, FireAllClients, FireClient
+	Detects incoming: OnClientEvent, OnClientInvoke (passive listener)
+]]
+local Main,Lib,Apps,Settings
+local Explorer,Properties,ScriptViewer,Notebook
+local API,RMD,env,service,plr,create,createSimple
+
+local function initDeps(data)
+	Main=data.Main; Lib=data.Lib; Apps=data.Apps; Settings=data.Settings
+	API=data.API; RMD=data.RMD; env=data.env; service=data.service
+	plr=data.plr; create=data.create; createSimple=data.createSimple
+end
+
+local function initAfterMain()
+	Explorer=Apps.Explorer; Properties=Apps.Properties
+	ScriptViewer=Apps.ScriptViewer; Notebook=Apps.Notebook
+end
+
+local function main()
+	local RemoteSpy = {}
+	local window
+
+	-- ── State ─────────────────────────────────────────────────────────
+	local logs            = {}
+	local MAX_LOGS        = 600
+	local paused          = false
+	local blacklist       = {}  -- {[instance]=true}
+	local blacklistNames  = {}  -- {[name]=true}
+	local blocklist       = {}  -- {[instance]=true} — blocks firing
+	local blocklistNames  = {}  -- {[name]=true}
+	local hookMethod      = "none"
+	local connectedRemotes= {}
+	local globalConns     = {}
+	local uiReady         = false
+	local onNewLog        = nil  -- callback from UI
+
+	-- ── Serialisation ─────────────────────────────────────────────────
+	local function ser(v, d)
+		d = d or 0
+		if d > 2 then return "..." end
+		local t = typeof(v)
+		if t == "string"  then
+			local s = string.format("%q", v)
+			return #s > 60 and s:sub(1,58)..'..."' or s
+		elseif t == "number"  then return string.format("%g", v)
+		elseif t == "boolean" then return tostring(v)
+		elseif t == "nil"     then return "nil"
+		elseif t == "Instance" then
+			local ok, fn = pcall(function() return v:GetFullName() end)
+			if ok then return fn:gsub("^DataModel%.", "game.") end
+			return "Instance"
+		elseif t == "Vector3" then
+			return string.format("Vector3.new(%g,%g,%g)", v.X, v.Y, v.Z)
+		elseif t == "Vector2" then
+			return string.format("Vector2.new(%g,%g)", v.X, v.Y)
+		elseif t == "CFrame" then
+			local p = v.Position
+			return string.format("CFrame.new(%g,%g,%g)", p.X, p.Y, p.Z)
+		elseif t == "Color3" then
+			return string.format("Color3.fromRGB(%d,%d,%d)",
+				math.floor(v.R*255+.5), math.floor(v.G*255+.5), math.floor(v.B*255+.5))
+		elseif t == "EnumItem" then return tostring(v)
+		elseif t == "table" then
+			if d >= 2 then return "{...}" end
+			local parts, n = {}, 0
+			for k, val in pairs(v) do
+				n = n + 1
+				if n > 6 then parts[#parts+1] = "..."; break end
+				local ks = type(k)=="number" and "" or (tostring(k).."=")
+				parts[#parts+1] = ks..ser(val, d+1)
+			end
+			return "{"..table.concat(parts,", ").."}"
+		else return tostring(v):sub(1,40) end
+	end
+
+	local function serArgs(args)
+		local p = {}
+		for _, v in ipairs(args) do p[#p+1] = ser(v) end
+		return table.concat(p, ", ")
+	end
+
+	local function remotePath(remote)
+		local ok, fn = pcall(function() return remote:GetFullName() end)
+		if ok then return fn:gsub("^DataModel%.", "game.") end
+		return "game.?"
+	end
+
+	local function genCode(path, method, argsStr)
+		return path .. ":" .. method .. "(" .. argsStr .. ")"
+	end
+
+	-- ── Log ───────────────────────────────────────────────────────────
+	local function addLog(remote, method, args, direction)
+		if paused then return end
+		if not pcall(function() return remote.Parent end) then return end
+		if blacklist[remote] then return end
+		if blacklistNames[remote.Name] then return end
+
+		local path = remotePath(remote)
+		local argsStr = serArgs(args)
+
+		local entry = {
+			remote    = remote,
+			name      = remote.Name,
+			path      = path,
+			class     = remote.ClassName,
+			method    = method,
+			args      = args,
+			argsStr   = argsStr,
+			direction = direction,  -- "out" | "in"
+			time      = os.date("%H:%M:%S"),
+			tickStamp = tick(),
+			code      = genCode(path, method, argsStr),
+		}
+
+		table.insert(logs, 1, entry)
+		if #logs > MAX_LOGS then table.remove(logs) end
+
+		if uiReady and onNewLog then
+			task.defer(onNewLog, entry)
+		end
+	end
+
+	-- ── Hook system ───────────────────────────────────────────────────
+	local origFS, origIS, origURE_FS, origFAC, origFC
+
+	local function hookViaMetamethod()
+		if not (hookmetamethod and getnamecallmethod) then return false end
+		local ok = pcall(function()
+			local old
+			local cb = function(self, ...)
+				local method = getnamecallmethod()
+				if typeof(self) == "Instance" and (
+					self:IsA("RemoteEvent") or
+					self:IsA("RemoteFunction") or
+					self:IsA("UnreliableRemoteEvent")
+				) then
+					local isFire = (method=="FireServer" or method=="InvokeServer"
+						or method=="FireAllClients" or method=="FireClient"
+						or method=="FireOtherClients")
+					if isFire then
+						addLog(self, method, {...}, "out")
+						if blocklist[self] or blocklistNames[self.Name] then
+							return nil
+						end
+					end
+				end
+				return old(self, ...)
+			end
+			old = hookmetamethod(oldgame, "__namecall", newcclosure and newcclosure(cb) or cb)
+		end)
+		if ok then hookMethod = "hookmetamethod" return true end
+		return false
+	end
+
+	local function hookViaFunction()
+		-- Xeno-compatible: hook the class method function directly.
+		-- Creating a temp instance gives us the raw function reference;
+		-- hookfunction patches it at the C level for ALL instances.
+		if not hookfunction then return false end
+		local ok = pcall(function()
+			local tmpRE  = Instance.new("RemoteEvent")
+			origFS       = tmpRE.FireServer
+			local tmpURE = Instance.new("UnreliableRemoteEvent")
+			origURE_FS   = tmpURE.FireServer
+			local tmpRF  = Instance.new("RemoteFunction")
+			origIS       = tmpRF.InvokeServer
+			tmpRE:Destroy(); tmpURE:Destroy(); tmpRF:Destroy()
+
+			hookfunction(origFS, function(self, ...)
+				addLog(self, "FireServer", {...}, "out")
+				if blocklist[self] or blocklistNames[self.Name] then return end
+				return origFS(self, ...)
+			end)
+
+			hookfunction(origURE_FS, function(self, ...)
+				addLog(self, "FireServer", {...}, "out")
+				if blocklist[self] or blocklistNames[self.Name] then return end
+				return origURE_FS(self, ...)
+			end)
+
+			hookfunction(origIS, function(self, ...)
+				addLog(self, "InvokeServer", {...}, "out")
+				if blocklist[self] or blocklistNames[self.Name] then return end
+				return origIS(self, ...)
+			end)
+		end)
+		if ok then hookMethod = "hookfunction" return true end
+		return false
+	end
+
+	local function connectRemoteIncoming(remote)
+		if connectedRemotes[remote] then return end
+		connectedRemotes[remote] = true
+		pcall(function()
+			if remote:IsA("RemoteEvent") or remote:IsA("UnreliableRemoteEvent") then
+				local c = remote.OnClientEvent:Connect(function(...)
+					addLog(remote, "OnClientEvent", {...}, "in")
+				end)
+				table.insert(globalConns, c)
+			elseif remote:IsA("RemoteFunction") then
+				-- Wrap OnClientInvoke non-destructively
+				local origOCI = remote.OnClientInvoke
+				remote.OnClientInvoke = function(...)
+					addLog(remote, "OnClientInvoke", {...}, "in")
+					if origOCI then return origOCI(...) end
+				end
+			end
+		end)
+	end
+
+	local function scanIncoming()
+		pcall(function()
+			for _, v in ipairs(oldgame:GetDescendants()) do
+				if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") or v:IsA("UnreliableRemoteEvent") then
+					connectRemoteIncoming(v)
+				end
+			end
+		end)
+		local c = oldgame.DescendantAdded:Connect(function(v)
+			if v:IsA("RemoteEvent") or v:IsA("RemoteFunction") or v:IsA("UnreliableRemoteEvent") then
+				task.wait(0.05)
+				pcall(connectRemoteIncoming, v)
+			end
+		end)
+		table.insert(globalConns, c)
+	end
+
+	local function setupHooks()
+		if not hookViaMetamethod() then
+			hookViaFunction()
+		end
+		task.spawn(scanIncoming)
+	end
+
+	-- ── UI ────────────────────────────────────────────────────────────
+	RemoteSpy.Init = function()
+		window = Lib.Window.new()
+		window:SetTitle("Remote Spy")
+		window:Resize(720, 470)
+		RemoteSpy.Window = window
+
+		local ts = service.TweenService
+		local content = window.GuiElems.Content
+
+		local C = {
+			bg      = Color3.fromRGB(12,12,12),
+			panel   = Color3.fromRGB(17,17,17),
+			row     = Color3.fromRGB(19,19,19),
+			rowAlt  = Color3.fromRGB(15,15,15),
+			rowSel  = Color3.fromRGB(38,38,38),
+			rowHov  = Color3.fromRGB(26,26,26),
+			border  = Color3.fromRGB(36,36,36),
+			btn     = Color3.fromRGB(30,30,30),
+			btnHov  = Color3.fromRGB(46,46,46),
+			btnPrs  = Color3.fromRGB(16,16,16),
+			text    = Color3.fromRGB(218,218,218),
+			dim     = Color3.fromRGB(110,110,110),
+			green   = Color3.fromRGB(75,195,100),
+			red     = Color3.fromRGB(205,65,65),
+			orange  = Color3.fromRGB(220,148,45),
+			blue    = Color3.fromRGB(95,155,225),
+			purple  = Color3.fromRGB(155,115,225),
+			teal    = Color3.fromRGB(65,195,155),
+		}
+
+		-- type colour + tag helpers
+		local function typeCol(cls)
+			if cls == "RemoteFunction" then return C.purple
+			elseif cls == "UnreliableRemoteEvent" then return C.teal
+			else return C.blue end
+		end
+		local function typeTag(cls)
+			if cls == "RemoteFunction" then return "RF"
+			elseif cls == "UnreliableRemoteEvent" then return "URE"
+			else return "RE" end
+		end
+
+		local ti = function(t) return TweenInfo.new(t or 0.11, Enum.EasingStyle.Quint, Enum.EasingDirection.Out) end
+
+		local function mkbtn(parent, text, pos, sz, col, tsz)
+			local b = Instance.new("TextButton", parent)
+			b.BackgroundColor3 = col or C.btn
+			b.BorderSizePixel  = 0; b.AutoButtonColor = false
+			b.Position = pos; b.Size = sz
+			b.Text = text; b.TextColor3 = C.text
+			b.Font = Enum.Font.SourceSansBold; b.TextSize = tsz or 12; b.ZIndex = 6
+			Instance.new("UICorner", b).CornerRadius = UDim.new(0,3)
+			b.MouseEnter:Connect(function()    ts:Create(b,ti(0.09),{BackgroundColor3=C.btnHov}):Play() end)
+			b.MouseLeave:Connect(function()    ts:Create(b,ti(0.14),{BackgroundColor3=col or C.btn}):Play() end)
+			b.MouseButton1Down:Connect(function() ts:Create(b,ti(0.06),{BackgroundColor3=C.btnPrs}):Play() end)
+			b.MouseButton1Up:Connect(function()   ts:Create(b,ti(0.1), {BackgroundColor3=C.btnHov}):Play() end)
+			return b
+		end
+
+		local function lbl(parent,text,pos,sz,col,font,tsz,xa)
+			local l = Instance.new("TextLabel",parent)
+			l.BackgroundTransparency=1; l.Position=pos; l.Size=sz
+			l.Text=text; l.TextColor3=col or C.text
+			l.Font=font or Enum.Font.SourceSans; l.TextSize=tsz or 12
+			l.TextXAlignment=xa or Enum.TextXAlignment.Left; l.ZIndex=6
+			return l
+		end
+
+		-- ── TOP BAR ───────────────────────────────────────────────────
+		local topBar = Instance.new("Frame", content)
+		topBar.BackgroundColor3 = C.panel; topBar.BorderSizePixel=0
+		topBar.Size = UDim2.new(1,0,0,30); topBar.ZIndex=4
+		local topDiv = Instance.new("Frame",topBar)
+		topDiv.BackgroundColor3=C.border; topDiv.BorderSizePixel=0
+		topDiv.Position=UDim2.new(0,0,1,-1); topDiv.Size=UDim2.new(1,0,0,1); topDiv.ZIndex=5
+
+		-- Status dot + label
+		local dot = Instance.new("Frame",topBar)
+		dot.BackgroundColor3=C.orange; dot.BorderSizePixel=0
+		dot.Position=UDim2.new(0,8,0.5,-4); dot.Size=UDim2.new(0,8,0,8); dot.ZIndex=7
+		Instance.new("UICorner",dot).CornerRadius=UDim.new(1,0)
+		local statusLbl = lbl(topBar,"Initializing...", UDim2.new(0,20,0,0),UDim2.new(0,108,1,0),C.dim)
+
+		-- Search
+		local searchFrame = Instance.new("Frame",topBar)
+		searchFrame.BackgroundColor3=Color3.fromRGB(22,22,22); searchFrame.BorderSizePixel=0
+		searchFrame.Position=UDim2.new(0,132,0.5,-9); searchFrame.Size=UDim2.new(0,170,0,19); searchFrame.ZIndex=6
+		Instance.new("UICorner",searchFrame).CornerRadius=UDim.new(0,3)
+		local searchBox = Instance.new("TextBox",searchFrame)
+		searchBox.BackgroundTransparency=1; searchBox.BorderSizePixel=0
+		searchBox.Position=UDim2.new(0,5,0,0); searchBox.Size=UDim2.new(1,-10,1,0)
+		searchBox.PlaceholderText="Filter by name / path..."
+		searchBox.PlaceholderColor3=Color3.fromRGB(80,80,80)
+		searchBox.Text=""; searchBox.TextColor3=C.text
+		searchBox.Font=Enum.Font.SourceSans; searchBox.TextSize=12; searchBox.ClearTextOnFocus=false; searchBox.ZIndex=7
+
+		local pauseBtn   = mkbtn(topBar,"⏸ Pause", UDim2.new(0,308,0.5,-9),UDim2.new(0,62,0,19))
+		local logCntLbl  = lbl(topBar,"0 logs",    UDim2.new(0,376,0,0),   UDim2.new(0,80,1,0),C.dim,nil,11)
+
+		-- ── MAIN AREA ─────────────────────────────────────────────────
+		local mainArea = Instance.new("Frame",content)
+		mainArea.BackgroundTransparency=1; mainArea.BorderSizePixel=0
+		mainArea.Position=UDim2.new(0,0,0,31); mainArea.Size=UDim2.new(1,0,1,-67); mainArea.ZIndex=3
+
+		-- Log scroll (left)
+		local logScroll = Instance.new("ScrollingFrame",mainArea)
+		logScroll.BackgroundColor3=C.bg; logScroll.BorderSizePixel=0
+		logScroll.Position=UDim2.new(0,0,0,0); logScroll.Size=UDim2.new(1,-210,1,0)
+		logScroll.ScrollBarThickness=5; logScroll.ScrollBarImageColor3=Color3.fromRGB(55,55,55)
+		logScroll.CanvasSize=UDim2.new(0,0,0,0); logScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; logScroll.ZIndex=3
+
+		local logLayout = Instance.new("UIListLayout",logScroll)
+		logLayout.SortOrder=Enum.SortOrder.LayoutOrder; logLayout.Padding=UDim.new(0,1)
+
+		-- Divider
+		local divider = Instance.new("Frame",mainArea)
+		divider.BackgroundColor3=C.border; divider.BorderSizePixel=0
+		divider.Position=UDim2.new(1,-210,0,0); divider.Size=UDim2.new(0,1,1,0); divider.ZIndex=4
+
+		-- Detail panel (right)
+		local detailPanel = Instance.new("Frame",mainArea)
+		detailPanel.BackgroundColor3=C.panel; detailPanel.BorderSizePixel=0
+		detailPanel.Position=UDim2.new(1,-209,0,0); detailPanel.Size=UDim2.new(0,209,1,0)
+		detailPanel.ClipsDescendants=true; detailPanel.ZIndex=4
+
+		-- Detail header
+		local detHdrBg = Instance.new("Frame",detailPanel)
+		detHdrBg.BackgroundColor3=Color3.fromRGB(20,20,20); detHdrBg.BorderSizePixel=0
+		detHdrBg.Size=UDim2.new(1,0,0,28); detHdrBg.ZIndex=5
+		local detHdrDiv=Instance.new("Frame",detHdrBg)
+		detHdrDiv.BackgroundColor3=C.border; detHdrDiv.BorderSizePixel=0
+		detHdrDiv.Position=UDim2.new(0,0,1,-1); detHdrDiv.Size=UDim2.new(1,0,0,1); detHdrDiv.ZIndex=6
+		local detTitle = lbl(detHdrBg,"Select a log entry",UDim2.new(0,8,0,0),UDim2.new(1,-10,1,0),C.dim,Enum.Font.SourceSansBold,13)
+
+		-- Detail info scroll
+		local detInfo = Instance.new("ScrollingFrame",detailPanel)
+		detInfo.BackgroundTransparency=1; detInfo.BorderSizePixel=0
+		detInfo.Position=UDim2.new(0,0,0,29); detInfo.Size=UDim2.new(1,0,0,105)
+		detInfo.ScrollBarThickness=3; detInfo.ScrollBarImageColor3=Color3.fromRGB(55,55,55)
+		detInfo.CanvasSize=UDim2.new(0,0,0,0); detInfo.AutomaticCanvasSize=Enum.AutomaticSize.Y; detInfo.ZIndex=5
+
+		local detText = Instance.new("TextLabel",detInfo)
+		detText.BackgroundTransparency=1; detText.Position=UDim2.new(0,5,0,3)
+		detText.Size=UDim2.new(1,-10,0,10); detText.AutomaticSize=Enum.AutomaticSize.Y
+		detText.Text=""; detText.TextColor3=Color3.fromRGB(185,185,185)
+		detText.Font=Enum.Font.Code; detText.TextSize=11; detText.TextXAlignment=Enum.TextXAlignment.Left
+		detText.TextWrapped=true; detText.RichText=true; detText.ZIndex=6
+
+		-- Action buttons (scrollable)
+		local actDiv=Instance.new("Frame",detailPanel)
+		actDiv.BackgroundColor3=C.border; actDiv.BorderSizePixel=0
+		actDiv.Position=UDim2.new(0,0,0,135); actDiv.Size=UDim2.new(1,0,0,1); actDiv.ZIndex=5
+
+		local actScroll=Instance.new("ScrollingFrame",detailPanel)
+		actScroll.BackgroundTransparency=1; actScroll.BorderSizePixel=0
+		actScroll.Position=UDim2.new(0,0,0,137); actScroll.Size=UDim2.new(1,0,1,-137)
+		actScroll.ScrollBarThickness=0; actScroll.CanvasSize=UDim2.new(0,0,0,0)
+		actScroll.AutomaticCanvasSize=Enum.AutomaticSize.Y; actScroll.ZIndex=5
+		local actLayout=Instance.new("UIListLayout",actScroll); actLayout.Padding=UDim.new(0,2)
+		local actPad=Instance.new("UIPadding",actScroll)
+		actPad.PaddingLeft=UDim.new(0,4); actPad.PaddingRight=UDim.new(0,4); actPad.PaddingTop=UDim.new(0,4)
+
+		local function actBtn(text, col)
+			local b = mkbtn(actScroll, text, UDim2.new(0,0,0,0), UDim2.new(1,0,0,21), col, 12)
+			b.TextXAlignment=Enum.TextXAlignment.Left
+			local p=Instance.new("UIPadding",b); p.PaddingLeft=UDim.new(0,6)
+			return b
+		end
+		local function actDivider()
+			local f=Instance.new("Frame",actScroll)
+			f.BackgroundColor3=C.border; f.BorderSizePixel=0; f.Size=UDim2.new(1,0,0,1)
+		end
+		local function actSection(txt)
+			local f=Instance.new("Frame",actScroll); f.BackgroundTransparency=1; f.Size=UDim2.new(1,0,0,16)
+			local l=Instance.new("TextLabel",f); l.BackgroundTransparency=1
+			l.Size=UDim2.new(1,0,1,0); l.Position=UDim2.new(0,6,0,0)
+			l.Text=txt; l.TextColor3=C.dim; l.Font=Enum.Font.SourceSansBold
+			l.TextSize=10; l.TextXAlignment=Enum.TextXAlignment.Left; l.ZIndex=7
+		end
+
+		actSection("ACTIONS")
+		local copyCodeBtn   = actBtn("📋  Copy Code")
+		local copyRemoteBtn = actBtn("🔗  Copy Path")
+		local runCodeBtn    = actBtn("▶  Run Code",   Color3.fromRGB(22,40,22))
+		local getScriptBtn  = actBtn("📄  Get Script")
+		local funcInfoBtn   = actBtn("🔍  Copy Info")
+		actDivider()
+		actSection("BLACKLIST")
+		local exclIBtn      = actBtn("🚫  Exclude Instance")
+		local exclNBtn      = actBtn("🚫  Exclude Name")
+		actDivider()
+		actSection("BLOCKLIST")
+		local blockIBtn     = actBtn("⛔  Block Instance", Color3.fromRGB(40,16,16))
+		local blockNBtn     = actBtn("⛔  Block Name",     Color3.fromRGB(40,16,16))
+
+		-- ── BOTTOM BAR ────────────────────────────────────────────────
+		local botBar=Instance.new("Frame",content)
+		botBar.BackgroundColor3=C.panel; botBar.BorderSizePixel=0
+		botBar.Position=UDim2.new(0,0,1,-36); botBar.Size=UDim2.new(1,0,0,36); botBar.ZIndex=4
+		local botDiv=Instance.new("Frame",botBar); botDiv.BackgroundColor3=C.border; botDiv.BorderSizePixel=0
+		botDiv.Size=UDim2.new(1,0,0,1); botDiv.ZIndex=5
+
+		local clearLogsBtn    = mkbtn(botBar,"🗑  Clear Logs",     UDim2.new(0,4,0.5,-9),   UDim2.new(0,82,0,19))
+		local clrBlacklistBtn = mkbtn(botBar,"Clear Blacklist",    UDim2.new(0,90,0.5,-9),  UDim2.new(0,88,0,19))
+		local clrBlocklistBtn = mkbtn(botBar,"Clear Blocklist",    UDim2.new(0,182,0.5,-9), UDim2.new(0,88,0,19))
+		local botInfo = lbl(botBar,"",UDim2.new(0,276,0,0),UDim2.new(1,-280,1,0),C.dim,nil,11)
+
+		local function setInfo(msg, col, dur)
+			botInfo.Text=msg; botInfo.TextColor3=col or C.dim
+			if dur then task.delay(dur, function() if botInfo.Text==msg then botInfo.Text="" end end) end
+		end
+
+		-- ── LOG RENDERING ─────────────────────────────────────────────
+		local logRows       = {}
+		local selectedEntry = nil
+		local filterStr     = ""
+		local dirtyLogs     = false
+
+		local function updateDetail(entry)
+			selectedEntry = entry
+			if not entry then
+				detTitle.Text="Select a log entry"; detTitle.TextColor3=C.dim
+				detText.Text=""; return
+			end
+			detTitle.Text = entry.name
+			detTitle.TextColor3 = typeCol(entry.class)
+
+			local dir    = entry.direction=="out" and '<font color="#dc9430">→ Server</font>' or '<font color="#5f9be1">← Client</font>'
+			local typeStr= '<font color="#'..typeCol(entry.class):ToHex()..'"><b>['..typeTag(entry.class)..']</b></font>'
+			local argsTxt= entry.argsStr~="" and entry.argsStr:gsub("<","&lt;"):gsub(">","&gt;") or "<i>no args</i>"
+			detText.Text = typeStr.."  "..dir..
+				"\n\n<b>Method:</b> "..entry.method..
+				"\n<b>Time:</b>   "..entry.time..
+				"\n\n<b>Path:</b>\n"..entry.path:gsub("<","&lt;"):gsub(">","&gt;")..
+				"\n\n<b>Args:</b>\n<font color=\"#aaaaaa\">"..argsTxt.."</font>"
+		end
+
+		local function filteredLogs()
+			if filterStr=="" then return logs end
+			local f=filterStr:lower(); local r={}
+			for _,e in ipairs(logs) do
+				if e.name:lower():find(f,1,true) or e.path:lower():find(f,1,true) then r[#r+1]=e end
+			end
+			return r
+		end
+
+		local function renderLogs()
+			-- remove old rows
+			for _,r in ipairs(logRows) do r:Destroy() end
+			logRows={}
+
+			local filtered=filteredLogs()
+			logCntLbl.Text=#logs.." logs"
+
+			for i,entry in ipairs(filtered) do
+				if i>300 then break end
+
+				local row=Instance.new("TextButton",logScroll)
+				local baseCol=(i%2==0) and C.rowAlt or C.row
+				row.BackgroundColor3=baseCol; row.BorderSizePixel=0; row.AutoButtonColor=false
+				row.Size=UDim2.new(1,0,0,22); row.Text=""; row.LayoutOrder=i; row.ZIndex=4
+
+				-- type badge
+				local badge=Instance.new("Frame",row)
+				badge.BackgroundColor3=typeCol(entry.class); badge.BorderSizePixel=0
+				badge.Position=UDim2.new(0,4,0.5,-7); badge.Size=UDim2.new(0,28,0,14); badge.ZIndex=5
+				Instance.new("UICorner",badge).CornerRadius=UDim.new(0,2)
+				local btxt=Instance.new("TextLabel",badge); btxt.BackgroundTransparency=1
+				btxt.Size=UDim2.new(1,0,1,0); btxt.Text=typeTag(entry.class)
+				btxt.TextColor3=Color3.new(1,1,1); btxt.Font=Enum.Font.SourceSansBold
+				btxt.TextSize=9; btxt.ZIndex=6
+
+				-- direction
+				local dirL=Instance.new("TextLabel",row); dirL.BackgroundTransparency=1
+				dirL.Position=UDim2.new(0,36,0,0); dirL.Size=UDim2.new(0,16,1,0)
+				dirL.Text=entry.direction=="out" and "→" or "←"
+				dirL.TextColor3=entry.direction=="out" and C.orange or C.blue
+				dirL.Font=Enum.Font.SourceSansBold; dirL.TextSize=14; dirL.ZIndex=5
+
+				-- name
+				local nameL=Instance.new("TextLabel",row); nameL.BackgroundTransparency=1
+				nameL.Position=UDim2.new(0,55,0,0); nameL.Size=UDim2.new(0,125,1,0)
+				nameL.Text=entry.name; nameL.TextColor3=C.text
+				nameL.Font=Enum.Font.SourceSansBold; nameL.TextSize=12
+				nameL.TextXAlignment=Enum.TextXAlignment.Left
+				nameL.TextTruncate=Enum.TextTruncate.AtEnd; nameL.ZIndex=5
+
+				-- method tag
+				local methodL=Instance.new("TextLabel",row); methodL.BackgroundTransparency=1
+				methodL.Position=UDim2.new(0,182,0,0); methodL.Size=UDim2.new(0,80,1,0)
+				methodL.Text=entry.method; methodL.TextColor3=C.dim
+				methodL.Font=Enum.Font.SourceSans; methodL.TextSize=11
+				methodL.TextXAlignment=Enum.TextXAlignment.Left
+				methodL.TextTruncate=Enum.TextTruncate.AtEnd; methodL.ZIndex=5
+
+				-- args preview
+				local argsL=Instance.new("TextLabel",row); argsL.BackgroundTransparency=1
+				argsL.Position=UDim2.new(0,265,0,0); argsL.Size=UDim2.new(1,-305,1,0)
+				argsL.Text=entry.argsStr~="" and entry.argsStr or "—"; argsL.TextColor3=Color3.fromRGB(90,90,90)
+				argsL.Font=Enum.Font.Code; argsL.TextSize=10
+				argsL.TextXAlignment=Enum.TextXAlignment.Left
+				argsL.TextTruncate=Enum.TextTruncate.AtEnd; argsL.ZIndex=5
+
+				-- time (right)
+				local timeL=Instance.new("TextLabel",row); timeL.BackgroundTransparency=1
+				timeL.Position=UDim2.new(1,-42,0,0); timeL.Size=UDim2.new(0,38,1,0)
+				timeL.Text=entry.time; timeL.TextColor3=Color3.fromRGB(70,70,70)
+				timeL.Font=Enum.Font.SourceSans; timeL.TextSize=10; timeL.ZIndex=5
+
+				row.MouseButton1Click:Connect(function()
+					for _,r in ipairs(logRows) do
+						local idx=r.LayoutOrder
+						ts:Create(r,ti(0.08),{BackgroundColor3=(idx%2==0) and C.rowAlt or C.row}):Play()
+					end
+					ts:Create(row,ti(0.08),{BackgroundColor3=C.rowSel}):Play()
+					updateDetail(entry)
+				end)
+				row.MouseEnter:Connect(function()
+					if selectedEntry~=entry then ts:Create(row,ti(0.07),{BackgroundColor3=C.rowHov}):Play() end
+				end)
+				row.MouseLeave:Connect(function()
+					if selectedEntry~=entry then
+						ts:Create(row,ti(0.12),{BackgroundColor3=baseCol}):Play()
+					end
+				end)
+
+				logRows[#logRows+1]=row
+			end
+		end
+
+		-- Efficient incremental: only re-render when dirty
+		onNewLog = function()
+			dirtyLogs = true
+		end
+
+		task.spawn(function()
+			local last = 0
+			while window.Gui.Parent do
+				task.wait(0.2)
+				local filt = searchBox.Text
+				if dirtyLogs or filt~=filterStr then
+					filterStr=filt; dirtyLogs=false
+					renderLogs()
+				end
+			end
+		end)
+
+		-- ── BUTTON WIRING ─────────────────────────────────────────────
+		pauseBtn.MouseButton1Click:Connect(function()
+			paused = not paused
+			pauseBtn.Text = paused and "▶ Resume" or "⏸ Pause"
+			ts:Create(pauseBtn,ti(0.1),{BackgroundColor3 = paused and Color3.fromRGB(50,30,8) or C.btn}):Play()
+		end)
+
+		clearLogsBtn.MouseButton1Click:Connect(function()
+			logs={}; selectedEntry=nil; updateDetail(nil); renderLogs()
+		end)
+		clrBlacklistBtn.MouseButton1Click:Connect(function()
+			blacklist={}; blacklistNames={}
+			setInfo("Blacklist cleared.",C.green,2)
+		end)
+		clrBlocklistBtn.MouseButton1Click:Connect(function()
+			blocklist={}; blocklistNames={}
+			setInfo("Blocklist cleared.",C.green,2)
+		end)
+
+		copyCodeBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			if env.setclipboard then env.setclipboard(selectedEntry.code) end
+			setInfo("✓  Code copied.",C.green,2)
+		end)
+		copyRemoteBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			if env.setclipboard then env.setclipboard(selectedEntry.path) end
+			setInfo("✓  Path copied.",C.green,2)
+		end)
+		runCodeBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry or not env.loadstring then return end
+			local fn,err=env.loadstring(selectedEntry.code)
+			if fn then
+				local ok,re=pcall(fn)
+				setInfo(ok and "✓  Fired." or "⛔ "..tostring(re):sub(1,50), ok and C.green or C.red, 3)
+			else setInfo("⛔ "..tostring(err):sub(1,50),C.red,3) end
+		end)
+		getScriptBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			local r=selectedEntry.remote
+			if not r or not pcall(function() return r.Parent end) then
+				setInfo("Remote gone.",C.orange,2); return
+			end
+			local p=r.Parent
+			while p do
+				if p:IsA("LuaSourceContainer") and Apps.ScriptViewer then
+					Apps.ScriptViewer.ViewScript(p); return
+				end
+				p=p.Parent
+			end
+			setInfo("No script in ancestry.",C.dim,2)
+		end)
+		funcInfoBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			local info=string.format("Name: %s\nClass: %s\nMethod: %s\nDirection: %s\nPath: %s\nArgs: %s",
+				selectedEntry.name, selectedEntry.class, selectedEntry.method,
+				selectedEntry.direction=="out" and "Client→Server" or "Server→Client",
+				selectedEntry.path, selectedEntry.argsStr~="" and selectedEntry.argsStr or "(none)")
+			if env.setclipboard then env.setclipboard(info) end
+			setInfo("✓  Info copied.",C.green,2)
+		end)
+		exclIBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			blacklist[selectedEntry.remote]=true
+			setInfo("Excluded: "..selectedEntry.name,C.orange,2)
+		end)
+		exclNBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			blacklistNames[selectedEntry.name]=true
+			setInfo("Excluded name: "..selectedEntry.name,C.orange,2)
+		end)
+		blockIBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			blocklist[selectedEntry.remote]=true
+			setInfo("Blocked: "..selectedEntry.name,C.red,2)
+		end)
+		blockNBtn.MouseButton1Click:Connect(function()
+			if not selectedEntry then return end
+			blocklistNames[selectedEntry.name]=true
+			setInfo("Blocked name: "..selectedEntry.name,C.red,2)
+		end)
+
+		-- ── HEADER ROW ────────────────────────────────────────────────
+		local hdr = Instance.new("Frame",content)
+		hdr.BackgroundColor3=Color3.fromRGB(16,16,16); hdr.BorderSizePixel=0
+		hdr.Position=UDim2.new(0,0,0,30); hdr.Size=UDim2.new(1,-209,0,18); hdr.ZIndex=4
+		local function hdrLbl(txt,px,w)
+			local l=lbl(hdr,txt,UDim2.new(0,px,0,0),UDim2.new(0,w,1,0),Color3.fromRGB(70,70,70),Enum.Font.SourceSansBold,10)
+			l.ZIndex=5; return l
+		end
+		hdrLbl("TYPE",4,28); hdrLbl("DIR",36,16); hdrLbl("NAME",55,120)
+		hdrLbl("METHOD",182,80); hdrLbl("ARGS",265,100); hdrLbl("TIME",-42,38)
+		-- right-align time
+		local tHdr=hdrLbl("TIME",-42,38)
+		tHdr.Position=UDim2.new(1,-42,0,0); tHdr.TextXAlignment=Enum.TextXAlignment.Left
+
+		local hdrDiv=Instance.new("Frame",content)
+		hdrDiv.BackgroundColor3=C.border; hdrDiv.BorderSizePixel=0
+		hdrDiv.Position=UDim2.new(0,0,0,48); hdrDiv.Size=UDim2.new(1,-209,0,1); hdrDiv.ZIndex=4
+
+		-- fix mainArea position to sit below header
+		mainArea.Position=UDim2.new(0,0,0,49)
+		mainArea.Size=UDim2.new(1,0,1,-85)
+
+		-- ── START HOOKS ───────────────────────────────────────────────
+		uiReady = true
+		task.spawn(function()
+			setupHooks()
+			if hookMethod == "hookmetamethod" then
+				dot.BackgroundColor3=C.green; statusLbl.Text="Hooked (meta) ✓"
+			elseif hookMethod == "hookfunction" then
+				dot.BackgroundColor3=C.green; statusLbl.Text="Hooked (func) ✓"
+			else
+				dot.BackgroundColor3=C.orange; statusLbl.Text="Passive (in only)"
+			end
+		end)
+	end
+
+	-- cleanup on window close
+	local origClose = window and window.Close
+	if window then
+		window.OnClose = function()
+			for _,c in ipairs(globalConns) do pcall(function() c:Disconnect() end) end
+			globalConns={}
+		end
+	end
+
+	return RemoteSpy
+end
+
+if gethsfuncs then
+	_G.moduleData = {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+else
+	return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+end
+end,
 }
 local oldgame = oldgame or game
 
@@ -14941,7 +15663,7 @@ end
 local isFsSupported = readfile and writefile and isfile and isfolder and listfiles and delfile and delfolder
 
 -- Main vars
-local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, Executor--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
+local Main, Explorer, Properties, ScriptViewer, Console, SaveInstance, ModelViewer, SettingsWindow, Executor, RemoteSpy--[[, SecretServicePanel]], DefaultSettings, Notebook, Serializer, Lib local ggv = getgenv or nil
 local API, RMD
 
 -- Default Settings
@@ -15080,7 +15802,7 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Executor"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Executor","RemoteSpy"}
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -15338,6 +16060,7 @@ Main = (function()
 		Notebook = Apps.Notebook
 		SettingsWindow = Apps.SettingsWindow
 		Executor = Apps.Executor
+		RemoteSpy = Apps.RemoteSpy
 		
 		
 		--SecretServicePanel = Apps.SecretServicePanel
@@ -15350,7 +16073,8 @@ Main = (function()
 			ModelViewer = ModelViewer,
 			Notebook = Notebook,
 			SettingsWindow = SettingsWindow,
-			Executor = Executor
+			Executor = Executor,
+			RemoteSpy = RemoteSpy
 			--SecretServicePanel = SecretServicePanel,
 		}
 		
@@ -16270,6 +16994,7 @@ Main = (function()
 
 		control.Enable = enable
 		control.Disable = disable
+		control.Gui = app  -- expose app frame so external code can reference it
 		Main.MenuApps[data.Name] = control
 		return control
 	end
@@ -16425,6 +17150,7 @@ Main = (function()
 		end})
 
 		Main.CreateApp({Name = "Executor",       IconMap = Main.LargeIcons, Icon = "ScriptEdit",     Window = Executor.Window})
+		Main.CreateApp({Name = "Remote Spy",     IconMap = Main.LargeIcons, Icon = "Output",          Window = RemoteSpy.Window})
 		Main.CreateApp({Name = "Notepad",        IconMap = Main.LargeIcons, Icon = "Script_Viewer",  Window = ScriptViewer.Window})
 		Main.CreateApp({Name = "Console",        IconMap = Main.LargeIcons, Icon = "Executor",       Window = Console.Window})
 		Main.CreateApp({Name = "Save Instance",  IconMap = Main.LargeIcons, Icon = "Book",           Window = SaveInstance.Window})
@@ -16449,10 +17175,11 @@ Main = (function()
 				Settings.Theme.ListSelection = p.ListSelection
 				Settings.Theme.Menu = p.Main1:lerp(Color3.fromRGB(0,0,0), 0.25)
 				Settings.Theme.TextBox = p.Main1:lerp(Color3.fromRGB(1,1,1), 0.05)
-				-- Update app name to show current theme
-				local appCtrl = Main.MenuApps["Theme: Dark"] or Main.MenuApps["Theme: Midnight"] or Main.MenuApps["Theme: Warm"] or Main.MenuApps["Theme: Slate"]
-				if appCtrl then appCtrl.Gui.Main.AppName.Text = "Theme:\n"..p.name end
-				Main.Reinit()
+				-- defer Reinit — calling it from inside a click handler causes
+				-- 'app' to be destroyed while we're still inside MouseButton1Click
+				task.defer(function()
+					Main.Reinit()
+				end)
 			end
 		end})
 		
@@ -16584,6 +17311,7 @@ Main = (function()
 		ModelViewer.Init()
 		SettingsWindow.Init()
 		Executor.Init()
+		RemoteSpy.Init()
 		--SecretServicePanel.Init()
 		
 		
