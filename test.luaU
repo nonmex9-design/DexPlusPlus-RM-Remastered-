@@ -14271,7 +14271,7 @@ local function main()
 		AddSeperator("Decompiler")
 		AddText("If executor does not support decompile, it will use the fallback option.")
 		AddText("'getbytecode' is mandatory to use fallback decompilers.")
-		local decompilerOption = {"Konstant", "AdvancedDecompiler", "Shiny"}
+		local decompilerOption = {"Konstant", "Konstant (LOCAL)", "AdvancedDecompiler", "Shiny"}
 		local decompiler = AddDropdown("Decompiler Fallback", decompilerOption, Settings.Decompiler.DecompilerFallback, false, 125)
 		decompiler.OnSelect:Connect(function()
 			Settings.Decompiler.DecompilerFallback = decompiler.Selected
@@ -16228,6 +16228,26 @@ Main = (function()
 
 			return konstantDecompile(...)
 		end
+		local KonstantLocalCache
+		pcall(function()
+			KonstantLocalCache = loadstring(game:HttpGet("https://raw.githubusercontent.com/accountrev/BetterSaveinstance/refs/heads/main/Dependencies/Konstant%20V2.1.luau"))()
+		end)
+
+		local function KonstantLocalDec(scriptInst)
+			if not KonstantLocalCache or type(KonstantLocalCache) ~= "table" or not KonstantLocalCache.decompile then
+				return "-- Konstant (LOCAL) failed to load or is not a valid module."
+			end
+			local success, bytecode = pcall(env.getscriptbytecode, scriptInst)
+			if not success then
+				return ("-- Failed to get script bytecode, error:\n\n--[[\n%s\n--]]"):format(bytecode)
+			end
+			local s, result = pcall(KonstantLocalCache.decompile, bytecode)
+			if not s then
+				return ("-- Konstant (LOCAL) error:\n--[[\n%s\n--]]"):format(tostring(result))
+			end
+			return result
+		end
+
 		local ADDec = AdvancedDecompilerCache or function() return "Failed to load Advanced Decompiler" end
 
 		local function ShinyDec(script_instance)
@@ -16276,6 +16296,10 @@ Main = (function()
 					local s, result = pcall(KonstantDec, scriptInst)
 					if s and not isErrorResult(result) then return result end
 					return "-- Konstant decompiler error (API may be down):\n--[[\n" .. tostring(s and result or result) .. "\n--]]"
+				elseif fallbackMode == "Konstant (LOCAL)" then
+					local s, result = pcall(KonstantLocalDec, scriptInst)
+					if s and not isErrorResult(result) then return result end
+					return "-- Konstant (LOCAL) decompiler error:\n--[[\n" .. tostring(s and result or result) .. "\n--]]"
 				elseif fallbackMode == "AdvancedDecompiler" then
 					local s, result = pcall(ADDec, scriptInst)
 					if s and not isErrorResult(result) then return result end
