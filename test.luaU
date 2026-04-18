@@ -7,7 +7,6 @@
 	Dex++ REMASTERED is an enhanced revival of Moon's Dex with improved UI,
 	smooth hover effects, additional features, and fixed decompiler support.
 ]]
--- hi asdasd
 
 local selection
 local nodes = {}
@@ -49,6 +48,666 @@ cloneref = cloneref or function(ref)
 end
 
 local EmbeddedModules = {
+-- ============================================================
+-- AIAssistant Module — Dex++ REMASTERED
+-- Drop this into EmbeddedModules and wire it up per the
+-- instructions at the bottom of this file.
+-- ============================================================
+
+--[[
+  HOW TO INTEGRATE
+  ────────────────
+  1. Add the EmbeddedModules entry (the big ["AIAssistant"] block) to
+     the EmbeddedModules table in your main script.
+
+  2. Add "AIAssistant" to Main.ModuleList:
+       Main.ModuleList = {"Explorer","Properties","ScriptViewer",
+                          "Console","SaveInstance","ModelViewer",
+                          "SettingsWindow","Executor","RemoteSpy",
+                          "AIAssistant"}          -- ← add here
+
+  3. In Main.LoadModules(), after the existing Init calls add:
+       AIAssistant = Apps.AIAssistant
+       -- and expose it in appTable:
+       AIAssistant = AIAssistant,
+       -- and call:
+       AIAssistant.Init()
+
+  4. In Main.CreateMainGui(), add an app button:
+       Main.CreateApp({Name = "AI Assistant",
+                       IconMap = Main.LargeIcons, Icon = "Honey",
+                       Window = AIAssistant.Window})
+
+  5. Paste the full ["AIAssistant"] block below into EmbeddedModules.
+--]]
+
+-- ╔══════════════════════════════════════════════════════════╗
+-- ║  EMBEDDED MODULE — paste this block into EmbeddedModules ║
+-- ╚══════════════════════════════════════════════════════════╝
+
+["AIAssistant"] = function()
+
+local GROQ_KEY = "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"
+local GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+local MODELS = {
+	{ id = "llama-3.3-70b-versatile",  label = "Llama 3.3 · 70B" },
+	{ id = "llama-3.1-8b-instant",     label = "Llama 3.1 · 8B  (fast)" },
+	{ id = "gemma2-9b-it",             label = "Gemma 2 · 9B" },
+	{ id = "llama3-70b-8192",          label = "Llama 3 · 70B" },
+	{ id = "llama3-8b-8192",           label = "Llama 3 · 8B" },
+}
+
+-- ── Markdown → Roblox RichText ────────────────────────────────────────────────
+local function mdEscape(s)
+	return s:gsub("&","&amp;"):gsub("<","&lt;"):gsub(">","&gt;")
+end
+
+local function mdToRich(raw)
+	local lines   = raw:split("\n")
+	local out     = {}
+	local codeBuf = {}
+	local inCode  = false
+
+	for _, line in ipairs(lines) do
+		-- fenced code block toggle
+		if line:match("^```") then
+			if inCode then
+				-- close block
+				local codeText = mdEscape(table.concat(codeBuf, "\n"))
+				out[#out+1] = '<font color="rgb(173,241,149)" face="Code">'..codeText.."</font>"
+				codeBuf  = {}
+				inCode   = false
+			else
+				inCode = true
+			end
+			continue
+		end
+
+		if inCode then
+			codeBuf[#codeBuf+1] = line
+			continue
+		end
+
+		-- headings
+		if line:match("^### ") then
+			out[#out+1] = '<font size="15"><b>'..mdEscape(line:sub(5)).."</b></font>"
+			continue
+		elseif line:match("^## ") then
+			out[#out+1] = '<font size="18"><b>'..mdEscape(line:sub(4)).."</b></font>"
+			continue
+		elseif line:match("^# ") then
+			out[#out+1] = '<font size="22"><b>'..mdEscape(line:sub(3)).."</b></font>"
+			continue
+		end
+
+		-- horizontal rule
+		if line:match("^%-%-%-") or line:match("^%*%*%*") then
+			out[#out+1] = '<font color="rgb(60,60,60)">─────────────────────────────</font>'
+			continue
+		end
+
+		-- escape HTML for normal lines
+		line = mdEscape(line)
+
+		-- bullet lists
+		line = line:gsub("^%- ", "• ")
+		line = line:gsub("^%* ", "• ")
+		-- numbered list (keep numbers, just indent a touch)
+		line = line:gsub("^(%d+%. )", "%1")
+
+		-- bold+italic ***text***
+		line = line:gsub("%*%*%*(.-)%*%*%*", "<b><i>%1</i></b>")
+		-- bold **text**
+		line = line:gsub("%*%*(.-)%*%*", "<b>%1</b>")
+		-- italic *text*
+		line = line:gsub("%*(.-)%*", "<i>%1</i>")
+		-- inline code `text`
+		line = line:gsub("`(.-)`",
+			'<font color="rgb(173,241,149)" face="Code">%1</font>')
+		-- strikethrough ~~text~~
+		line = line:gsub("~~(.-)~~",
+			'<font color="rgb(110,110,110)"><s>%1</s></font>')
+		-- > blockquote
+		if line:match("^&gt; ") then
+			line = '<font color="rgb(120,120,120)">│ '..line:sub(6).."</font>"
+		end
+
+		out[#out+1] = line
+	end
+
+	-- if file ended while in code block
+	if inCode and #codeBuf > 0 then
+		out[#out+1] = '<font color="rgb(173,241,149)" face="Code">'
+		             ..mdEscape(table.concat(codeBuf,"\n")).."</font>"
+	end
+
+	return table.concat(out, "\n")
+end
+
+-- ── Module skeleton ───────────────────────────────────────────────────────────
+local Main,Lib,Apps,Settings
+local Explorer,Properties,ScriptViewer,Notebook
+local API,RMD,env,service,plr,create,createSimple
+
+local function initDeps(data)
+	Main=data.Main; Lib=data.Lib; Apps=data.Apps; Settings=data.Settings
+	API=data.API; RMD=data.RMD; env=data.env; service=data.service
+	plr=data.plr; create=data.create; createSimple=data.createSimple
+end
+
+local function initAfterMain()
+	Explorer=Apps.Explorer; Properties=Apps.Properties
+	ScriptViewer=Apps.ScriptViewer; Notebook=Apps.Notebook
+end
+
+local function main()
+	local AIAssistant = {}
+	local window
+
+	-- ── Colour palette ─────────────────────────────────────────────────────────
+	local C = {
+		bg       = Color3.fromRGB(12,12,12),
+		panel    = Color3.fromRGB(18,18,18),
+		border   = Color3.fromRGB(36,36,36),
+		userBg   = Color3.fromRGB(18,38,68),
+		aiBg     = Color3.fromRGB(20,20,20),
+		btn      = Color3.fromRGB(28,28,28),
+		btnHov   = Color3.fromRGB(46,46,46),
+		btnPrs   = Color3.fromRGB(14,14,14),
+		accent   = Color3.fromRGB(11,90,175),
+		accentHov= Color3.fromRGB(18,115,210),
+		text     = Color3.fromRGB(220,220,220),
+		dim      = Color3.fromRGB(100,100,100),
+		userHdr  = Color3.fromRGB(130,185,255),
+		aiHdr    = Color3.fromRGB(90,210,130),
+		errCol   = Color3.fromRGB(220,75,75),
+	}
+
+	local function ti(t,s,d)
+		return TweenInfo.new(t or .12, s or Enum.EasingStyle.Quint, d or Enum.EasingDirection.Out)
+	end
+
+	-- generic styled button helper
+	local function mkBtn(parent, text, pos, sz, col, tsz)
+		local b = Instance.new("TextButton", parent)
+		b.BackgroundColor3 = col or C.btn
+		b.BorderSizePixel  = 0; b.AutoButtonColor = false
+		b.Position = pos; b.Size = sz
+		b.Text = text; b.TextColor3 = C.text
+		b.Font = Enum.Font.SourceSansBold; b.TextSize = tsz or 12; b.ZIndex = 6
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0,4)
+		local orig = col or C.btn
+		b.MouseEnter:Connect(function()
+			service.TweenService:Create(b,ti(.09),{BackgroundColor3=C.btnHov}):Play()
+		end)
+		b.MouseLeave:Connect(function()
+			service.TweenService:Create(b,ti(.14),{BackgroundColor3=orig}):Play()
+		end)
+		b.MouseButton1Down:Connect(function()
+			service.TweenService:Create(b,ti(.06),{BackgroundColor3=C.btnPrs}):Play()
+		end)
+		b.MouseButton1Up:Connect(function()
+			service.TweenService:Create(b,ti(.10),{BackgroundColor3=C.btnHov}):Play()
+		end)
+		return b
+	end
+
+	-- ── Init ───────────────────────────────────────────────────────────────────
+	AIAssistant.Init = function()
+		window = Lib.Window.new()
+		window:SetTitle("AI Assistant")
+		window:Resize(540, 480)
+		AIAssistant.Window = window
+
+		local TS  = service.TweenService
+		local HTTP = game:GetService("HttpService")
+		local cont = window.GuiElems.Content
+
+		-- ── state ──────────────────────────────────────────────────────────────
+		local selModel   = MODELS[1]
+		local history    = {}          -- {role=,content=}
+		local busy       = false
+		local msgIndex   = 0
+
+		local SYSTEM_PROMPT = [[You are an expert Roblox/Luau assistant embedded inside Dex++ REMASTERED, a professional debugging tool for Roblox. You specialise in:
+• Decompiling, reading and explaining Luau scripts
+• Identifying exploits, remote handlers and obfuscation patterns
+• Debugging client-side and server-side Roblox code
+• Explaining Roblox engine APIs (Instance hierarchy, services, events)
+• Writing clean, idiomatic Luau code snippets
+
+Formatting rules:
+- Use **bold** for important terms
+- Use `backticks` for property/method names
+- Use fenced code blocks (```lua) for any code
+- Use ### headings for sections
+- Keep answers concise but complete]]
+
+		-- ── top bar ────────────────────────────────────────────────────────────
+		local topBar = Instance.new("Frame", cont)
+		topBar.BackgroundColor3 = C.panel
+		topBar.BorderSizePixel  = 0
+		topBar.Size = UDim2.new(1,0,0,30); topBar.ZIndex = 4
+
+		local function topLine()
+			local l = Instance.new("Frame",topBar)
+			l.BackgroundColor3=C.border; l.BorderSizePixel=0
+			l.Position=UDim2.new(0,0,1,-1); l.Size=UDim2.new(1,0,0,1); l.ZIndex=5
+		end
+		topLine()
+
+		-- model label
+		local modLbl = Instance.new("TextLabel", topBar)
+		modLbl.BackgroundTransparency=1; modLbl.Position=UDim2.new(0,6,0,0)
+		modLbl.Size=UDim2.new(0,48,1,0); modLbl.Text="Model:"
+		modLbl.TextColor3=C.dim; modLbl.Font=Enum.Font.SourceSans
+		modLbl.TextSize=12; modLbl.TextXAlignment=Enum.TextXAlignment.Left; modLbl.ZIndex=5
+
+		-- model dropdown btn
+		local modBtn = mkBtn(topBar, selModel.label.." ▾",
+		                     UDim2.new(0,56,0.5,-9), UDim2.new(0,168,0,19), C.btn, 11)
+		modBtn.TextXAlignment = Enum.TextXAlignment.Left
+		local modPad = Instance.new("UIPadding", modBtn)
+		modPad.PaddingLeft = UDim.new(0,6)
+
+		-- right-side buttons
+		local decompBtn = mkBtn(topBar,"📄 Script Context",
+		                        UDim2.new(1,-226,0.5,-9), UDim2.new(0,106,0,19), C.btn, 11)
+		local clearBtn  = mkBtn(topBar,"🗑 Clear",
+		                        UDim2.new(1,-116,0.5,-9), UDim2.new(0,56,0,19), C.btn, 11)
+		local copyAllBtn= mkBtn(topBar,"📋 All",
+		                        UDim2.new(1,-56,0.5,-9),  UDim2.new(0,50,0,19), C.btn, 11)
+
+		-- ── chat scroll area ───────────────────────────────────────────────────
+		local chatScroll = Instance.new("ScrollingFrame", cont)
+		chatScroll.BackgroundColor3 = C.bg
+		chatScroll.BorderSizePixel  = 0
+		chatScroll.Position = UDim2.new(0,0,0,31)
+		chatScroll.Size     = UDim2.new(1,0,1,-77)
+		chatScroll.ScrollBarThickness = 5
+		chatScroll.ScrollBarImageColor3 = Color3.fromRGB(50,50,50)
+		chatScroll.CanvasSize = UDim2.new(0,0,0,0)
+		chatScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		chatScroll.ZIndex = 3
+
+		local chatLayout = Instance.new("UIListLayout", chatScroll)
+		chatLayout.SortOrder = Enum.SortOrder.LayoutOrder
+		chatLayout.Padding   = UDim.new(0,5)
+
+		local chatPad = Instance.new("UIPadding", chatScroll)
+		chatPad.PaddingLeft   = UDim.new(0,7)
+		chatPad.PaddingRight  = UDim.new(0,7)
+		chatPad.PaddingTop    = UDim.new(0,7)
+		chatPad.PaddingBottom = UDim.new(0,7)
+
+		-- ── bottom input bar ───────────────────────────────────────────────────
+		local botBar = Instance.new("Frame", cont)
+		botBar.BackgroundColor3 = C.panel
+		botBar.BorderSizePixel  = 0
+		botBar.Position = UDim2.new(0,0,1,-46)
+		botBar.Size     = UDim2.new(1,0,0,46)
+		botBar.ZIndex   = 4
+
+		local botLine = Instance.new("Frame", botBar)
+		botLine.BackgroundColor3=C.border; botLine.BorderSizePixel=0
+		botLine.Size=UDim2.new(1,0,0,1); botLine.ZIndex=5
+
+		local inputFrame = Instance.new("Frame", botBar)
+		inputFrame.BackgroundColor3 = Color3.fromRGB(20,20,20)
+		inputFrame.BorderSizePixel  = 0
+		inputFrame.Position = UDim2.new(0,6,0,7)
+		inputFrame.Size     = UDim2.new(1,-70,0,32)
+		inputFrame.ZIndex   = 5
+		Instance.new("UICorner", inputFrame).CornerRadius = UDim.new(0,6)
+		local iStroke = Instance.new("UIStroke", inputFrame)
+		iStroke.Color=C.border; iStroke.Thickness=1
+
+		local inputBox = Instance.new("TextBox", inputFrame)
+		inputBox.BackgroundTransparency = 1
+		inputBox.BorderSizePixel = 0
+		inputBox.Position = UDim2.new(0,8,0,0)
+		inputBox.Size     = UDim2.new(1,-12,1,0)
+		inputBox.PlaceholderText = "Ask about scripts, APIs, Roblox Lua…"
+		inputBox.PlaceholderColor3 = Color3.fromRGB(62,62,62)
+		inputBox.Text = ""; inputBox.TextColor3 = C.text
+		inputBox.Font = Enum.Font.SourceSans; inputBox.TextSize = 13
+		inputBox.ClearTextOnFocus = false; inputBox.MultiLine = false
+		inputBox.TextXAlignment = Enum.TextXAlignment.Left; inputBox.ZIndex = 6
+
+		local sendBtn = mkBtn(botBar,"▶ Send",
+		                      UDim2.new(1,-62,0,7), UDim2.new(0,56,0,32),
+		                      C.accent, 13)
+
+		-- accent hover override
+		sendBtn.MouseEnter:Connect(function()
+			TS:Create(sendBtn,ti(.09),{BackgroundColor3=C.accentHov}):Play()
+		end)
+		sendBtn.MouseLeave:Connect(function()
+			TS:Create(sendBtn,ti(.14),{BackgroundColor3=C.accent}):Play()
+		end)
+
+		-- status bar (inside botBar)
+		local statusLbl = Instance.new("TextLabel", botBar)
+		statusLbl.BackgroundTransparency=1
+		statusLbl.Position=UDim2.new(0,6,1,-13)
+		statusLbl.Size=UDim2.new(1,-12,0,12)
+		statusLbl.Text=""; statusLbl.TextColor3=C.dim
+		statusLbl.Font=Enum.Font.SourceSans; statusLbl.TextSize=10
+		statusLbl.TextXAlignment=Enum.TextXAlignment.Left; statusLbl.ZIndex=5
+
+		local function setStatus(msg,col,dur)
+			statusLbl.Text=msg; statusLbl.TextColor3=col or C.dim
+			if dur then
+				task.delay(dur,function()
+					if statusLbl.Text==msg then statusLbl.Text="" end
+				end)
+			end
+		end
+
+		-- ── chat message builder ───────────────────────────────────────────────
+		local function scrollBottom()
+			task.defer(function()
+				chatScroll.CanvasPosition = Vector2.new(0,math.huge)
+			end)
+		end
+
+		-- returns {frame, headerLbl, contentLbl}
+		local function addMsg(role, text, modelLabel)
+			msgIndex = msgIndex + 1
+			local isUser = (role == "user")
+
+			local card = Instance.new("Frame", chatScroll)
+			card.BackgroundColor3 = isUser and C.userBg or C.aiBg
+			card.BorderSizePixel  = 0
+			card.AutomaticSize    = Enum.AutomaticSize.Y
+			card.Size             = UDim2.new(1,0,0,0)
+			card.LayoutOrder      = msgIndex
+			card.ZIndex           = 4
+			Instance.new("UICorner", card).CornerRadius = UDim.new(0,7)
+
+			-- left accent bar (AI only)
+			if not isUser then
+				local bar = Instance.new("Frame", card)
+				bar.BackgroundColor3 = Color3.fromRGB(11,90,175)
+				bar.BorderSizePixel  = 0
+				bar.Position = UDim2.new(0,0,0,0)
+				bar.Size     = UDim2.new(0,3,1,0)
+				bar.ZIndex   = 5
+				local bc = Instance.new("UICorner", bar); bc.CornerRadius=UDim.new(0,3)
+			end
+
+			local pad = Instance.new("UIPadding", card)
+			pad.PaddingLeft  = UDim.new(0, isUser and 8 or 12)
+			pad.PaddingRight = UDim.new(0,8)
+			pad.PaddingTop   = UDim.new(0,6)
+			pad.PaddingBottom= UDim.new(0,6)
+
+			local inner = Instance.new("Frame", card)
+			inner.BackgroundTransparency=1
+			inner.Size=UDim2.new(1,0,0,0)
+			inner.AutomaticSize=Enum.AutomaticSize.Y
+			inner.ZIndex=4
+
+			local il = Instance.new("UIListLayout", inner)
+			il.SortOrder=Enum.SortOrder.LayoutOrder; il.Padding=UDim.new(0,3)
+
+			-- header (who is talking)
+			local hdr = Instance.new("TextLabel", inner)
+			hdr.BackgroundTransparency=1
+			hdr.Size=UDim2.new(1,0,0,15); hdr.LayoutOrder=0
+			hdr.Font=Enum.Font.SourceSansBold; hdr.TextSize=11
+			hdr.TextXAlignment=Enum.TextXAlignment.Left; hdr.ZIndex=5
+			if isUser then
+				hdr.Text="You"; hdr.TextColor3=C.userHdr
+			else
+				hdr.Text=(modelLabel or selModel.label); hdr.TextColor3=C.aiHdr
+			end
+
+			-- content label (RichText)
+			local cLbl = Instance.new("TextLabel", inner)
+			cLbl.BackgroundTransparency=1
+			cLbl.Size=UDim2.new(1,0,0,0)
+			cLbl.AutomaticSize=Enum.AutomaticSize.Y
+			cLbl.LayoutOrder=1
+			cLbl.Font=Enum.Font.SourceSans; cLbl.TextSize=13
+			cLbl.TextXAlignment=Enum.TextXAlignment.Left
+			cLbl.TextColor3=C.text; cLbl.TextWrapped=true
+			cLbl.RichText=true; cLbl.ZIndex=5
+
+			if isUser then
+				cLbl.Text = mdEscape(text)
+			else
+				cLbl.Text = mdToRich(text)
+			end
+
+			-- copy button row
+			local copyRow = Instance.new("Frame", inner)
+			copyRow.BackgroundTransparency=1
+			copyRow.Size=UDim2.new(1,0,0,18); copyRow.LayoutOrder=2; copyRow.ZIndex=4
+
+			local cpBtn = mkBtn(copyRow,"📋 Copy",UDim2.new(0,0,0,0),UDim2.new(0,58,0,16))
+			cpBtn.TextColor3=C.dim
+			cpBtn.MouseEnter:Connect(function() cpBtn.TextColor3=C.text end)
+			cpBtn.MouseLeave:Connect(function() cpBtn.TextColor3=C.dim end)
+			cpBtn.MouseButton1Click:Connect(function()
+				if env.setclipboard then env.setclipboard(text) end
+				cpBtn.Text="✓ Copied!"; cpBtn.TextColor3=Color3.fromRGB(90,210,130)
+				task.delay(2,function() cpBtn.Text="📋 Copy"; cpBtn.TextColor3=C.dim end)
+			end)
+
+			scrollBottom()
+			return {frame=card, header=hdr, content=cLbl}
+		end
+
+		-- ── Groq API call ──────────────────────────────────────────────────────
+		local allChatText = {} -- plain text log for "copy all"
+
+		local function callGroq(userMsg)
+			if busy then return end
+			busy = true
+			sendBtn.Text = "…"
+			sendBtn.Active = false
+			TS:Create(sendBtn,ti(.1),{BackgroundColor3=Color3.fromRGB(8,60,120)}):Play()
+			setStatus("Sending to "..selModel.label.."…")
+
+			history[#history+1] = {role="user", content=userMsg}
+			allChatText[#allChatText+1] = "You: "..userMsg
+
+			-- thinking placeholder
+			local thinking = addMsg("assistant","⏳ Thinking…", selModel.label)
+
+			-- snapshot model in case user switches mid-request
+			local calledModel = selModel
+
+			task.spawn(function()
+				local ok, result = pcall(function()
+					local messages = {{role="system",content=SYSTEM_PROMPT}}
+					for _, m in ipairs(history) do
+						messages[#messages+1] = m
+					end
+
+					local body = game:GetService("HttpService"):JSONEncode({
+						model       = calledModel.id,
+						messages    = messages,
+						max_tokens  = 2048,
+						temperature = 0.7,
+					})
+
+					local reqFn = env.request or syn and syn.request or http_request or request
+					if not reqFn then error("No HTTP request function available (request/syn.request)") end
+
+					local resp = reqFn({
+						Url    = GROQ_URL,
+						Method = "POST",
+						Headers = {
+							["Authorization"] = "Bearer "..GROQ_KEY,
+							["Content-Type"]  = "application/json",
+						},
+						Body = body,
+					})
+
+					if resp.StatusCode ~= 200 then
+						error("HTTP "..resp.StatusCode..": "..tostring(resp.Body):sub(1,200))
+					end
+
+					local decoded = game:GetService("HttpService"):JSONDecode(resp.Body)
+					return decoded.choices[1].message.content
+				end)
+
+				if ok then
+					history[#history+1] = {role="assistant", content=result}
+					allChatText[#allChatText+1] = calledModel.label..": "..result
+					-- update thinking card
+					thinking.header.Text   = calledModel.label
+					thinking.content.Text  = mdToRich(result)
+					-- fix copy button raw text closure
+					local rawResult = result
+					-- update copy btn's closure
+					local cpBtn2 = thinking.frame:FindFirstChild("Frame",true)
+					-- easiest: just rebuild by storing result on the frame
+					thinking.frame:SetAttribute("_raw", rawResult)
+					-- patch the copy btn
+					for _, ch in ipairs(thinking.frame:GetDescendants()) do
+						if ch:IsA("TextButton") and ch.Text == "📋 Copy" then
+							ch.MouseButton1Click:Connect(function()
+								if env.setclipboard then env.setclipboard(rawResult) end
+								ch.Text="✓ Copied!"; ch.TextColor3=Color3.fromRGB(90,210,130)
+								task.delay(2,function() ch.Text="📋 Copy"; ch.TextColor3=C.dim end)
+							end)
+						end
+					end
+					setStatus("Response from "..calledModel.label.." ✓", Color3.fromRGB(90,210,130), 4)
+				else
+					thinking.content.Text  = "⛔ **Error:** "..mdEscape(tostring(result))
+					thinking.content.TextColor3 = C.errCol
+					setStatus("Request failed.", C.errCol, 5)
+				end
+
+				busy = false
+				sendBtn.Text   = "▶ Send"
+				sendBtn.Active = true
+				TS:Create(sendBtn,ti(.1),{BackgroundColor3=C.accent}):Play()
+				scrollBottom()
+			end)
+		end
+
+		-- ── send logic ─────────────────────────────────────────────────────────
+		local function doSend()
+			local msg = inputBox.Text:match("^%s*(.-)%s*$")
+			if msg == "" or busy then return end
+			inputBox.Text = ""
+			addMsg("user", msg)
+			callGroq(msg)
+		end
+
+		sendBtn.MouseButton1Click:Connect(doSend)
+		inputBox.FocusLost:Connect(function(enter)
+			if enter then doSend() end
+		end)
+
+		-- ── model switcher ─────────────────────────────────────────────────────
+		modBtn.MouseButton1Click:Connect(function()
+			local ctx = Lib.ContextMenu.new()
+			ctx.Iconless = true; ctx.Width = 200; ctx.MaxHeight = 220
+			ctx.ReverseYOffset = 22
+
+			for _, m in ipairs(MODELS) do
+				local snap = m
+				ctx:Add({
+					Name = (snap.id==selModel.id and "✓  " or "   ")..snap.label,
+					OnClick = function()
+						selModel = snap
+						modBtn.Text = snap.label.." ▾"
+					end
+				})
+			end
+
+			ctx:Show(modBtn.AbsolutePosition.X, modBtn.AbsolutePosition.Y + 22)
+		end)
+
+		-- ── clear chat ─────────────────────────────────────────────────────────
+		clearBtn.MouseButton1Click:Connect(function()
+			history = {}; allChatText = {}; msgIndex = 0
+			for _, c in ipairs(chatScroll:GetChildren()) do
+				if not c:IsA("UIListLayout") and not c:IsA("UIPadding") then
+					c:Destroy()
+				end
+			end
+			setStatus("Chat cleared.", C.dim, 2)
+		end)
+
+		-- ── copy entire conversation ────────────────────────────────────────────
+		copyAllBtn.MouseButton1Click:Connect(function()
+			if env.setclipboard then
+				env.setclipboard(table.concat(allChatText,"\n\n"))
+				setStatus("✓ Full conversation copied to clipboard.", Color3.fromRGB(90,210,130), 3)
+			end
+		end)
+
+		-- ── script context helper ──────────────────────────────────────────────
+		decompBtn.MouseButton1Click:Connect(function()
+			if not Explorer or not Explorer.Selection then
+				setStatus("Explorer not available.", C.errCol, 3); return
+			end
+			local sList = Explorer.Selection.List
+			if #sList == 0 then
+				setStatus("Select a script in Explorer first.", C.errCol, 3); return
+			end
+
+			local obj = sList[1].Obj
+			if not obj:IsA("LuaSourceContainer") then
+				setStatus("Selected instance is not a script.", C.errCol, 3); return
+			end
+
+			local source = ""
+			if env.decompile and env.isViableDecompileScript and env.isViableDecompileScript(obj) then
+				setStatus("Decompiling "..obj.Name.."…")
+				local s, res = pcall(env.decompile, obj)
+				source = (s and res) or ("-- Decompile failed: "..tostring(res))
+			else
+				source = "-- This script type cannot be decompiled on the client.\n-- Class: "..obj.ClassName
+			end
+
+			-- hard cap to avoid token overflow
+			if #source > 4000 then
+				source = source:sub(1,4000).."\n-- [TRUNCATED — too long]"
+			end
+
+			local path = pcall(function() return Explorer.GetInstancePath(obj) end) and Explorer.GetInstancePath(obj) or obj.Name
+			local prompt = "Please analyse and explain the following decompiled Roblox "
+			              ..obj.ClassName.." script from `"..path.."`:\n\n"
+			              .."```lua\n"..source.."\n```\n\n"
+			              .."Focus on: what it does, any interesting patterns, and potential issues."
+
+			inputBox.Text = prompt
+			setStatus("Script pasted. Press Send when ready.", C.dim, 5)
+		end)
+
+		-- ── welcome message ─────────────────────────────────────────────────────
+		addMsg("assistant",
+			"# 👋 Welcome to AI Assistant\n\n"
+			.."I'm powered by **"..MODELS[1].label.."** (Groq API) and embedded right inside Dex++.\n\n"
+			.."**What I can help with:**\n"
+			.."- Explain & analyse decompiled scripts\n"
+			.."- Debug Luau / Roblox code\n"
+			.."- Answer Roblox API questions\n"
+			.."- Generate code snippets\n\n"
+			.."**Quick tips:**\n"
+			.."- Click **📄 Script Context** to auto-paste the selected script from Explorer\n"
+			.."- Switch models with the dropdown at the top\n"
+			.."- Press **Enter** or click **▶ Send** to chat\n\n"
+			.."*Ask me anything!*",
+			MODELS[1].label)
+	end
+
+	return AIAssistant
+end
+
+
+return {InitDeps = initDeps, InitAfterMain = initAfterMain, Main = main}
+end,
+
 ["Console"] = function()
 --[[
 	Console Module
@@ -13313,18 +13972,19 @@ local function main()
 	local fileName = "Place_"..game.PlaceId.."_"..game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId).Name.."_{TIMESTAMP}"
 	local Saving = false
 	
-	local SaveInstanceArgs = {
-		Decompile = true,
-		DecompileTimeout = 10,
-		DecompileIgnore = {"Chat", "CoreGui", "CorePackages"},
-		NilInstances = false,
-		RemovePlayerCharacters = true,
-		SavePlayers = false,
-		MaxThreads = 3,
-		ShowStatus = true,
-		IgnoreDefaultProps = true,
-		IsolateStarterPlayer = true
-	}
+local SaveInstanceArgs = {
+    Decompile = true,
+    DecompileTimeout = 10,
+    DecompileIgnore = {"Chat", "CoreGui", "CorePackages"},
+    NilInstances = false,
+    RemovePlayerCharacters = true,
+    SavePlayers = false,
+    MaxThreads = 3,
+    ShowStatus = true,
+    IgnoreDefaultProps = true,
+    IsolateStarterPlayer = true,
+    SafeMode = false,          -- ADD THIS LINE
+}
 	
 	local function AddCheckbox(title, default)
 		local frame = Lib.Frame.new()
@@ -13517,6 +14177,12 @@ local function main()
 			SaveInstanceArgs.ShowStatus = ShowStat.Toggled
 		end)
 		
+		local SafeModeCheck = AddCheckbox("Safe Mode (Kick before saving)", SaveInstanceArgs.SafeMode or false)
+		SafeModeCheck.OnInput:Connect(function()
+			SaveInstanceArgs.SafeMode = SafeModeCheck.Toggled
+		end)
+
+		
 		
 		-- Decompile buttons below
 		local FilenameTextBox = Lib.ViewportTextBox.new()
@@ -13571,7 +14237,7 @@ local function main()
 				window:SetTitle("Save Instance - Saved")
 			else
 				window:SetTitle("Save Instance - Error")
-				task.spawn(error("Failed to save the game: "..result))
+				warn("Failed to save the game: " .. tostring(result))
 			end
 			task.wait(5)
 			window:SetTitle("Save Instance")
@@ -15803,7 +16469,9 @@ end
 Main = (function()
 	local Main = {}
 
-	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console","SaveInstance","ModelViewer","SettingsWindow","Executor","RemoteSpy"}
+	Main.ModuleList = {"Explorer","Properties","ScriptViewer","Console",
+                   "SaveInstance","ModelViewer","SettingsWindow",
+                   "Executor","RemoteSpy","AIAssistant"}  -- ← add
 	Main.Elevated = false
 	Main.AllowDraggableOnMobile = true
 	Main.MissingEnv = {}
@@ -16062,6 +16730,7 @@ Main = (function()
 		SettingsWindow = Apps.SettingsWindow
 		Executor = Apps.Executor
 		RemoteSpy = Apps.RemoteSpy
+		AIAssistant = Apps.AIAssistant
 		
 		
 		--SecretServicePanel = Apps.SecretServicePanel
@@ -17157,6 +17826,7 @@ Main = (function()
 		-- Create Main Apps
 		Main.CreateApp({Name = "Explorer",       IconMap = Main.LargeIcons, Icon = "Explorer",       Open = true, Window = Explorer.Window})
 		Main.CreateApp({Name = "Properties",     IconMap = Main.LargeIcons, Icon = "Properties",     Open = true, Window = Properties.Window})
+		Main.CreateApp({Name = "AI Assistant",   IconMap = Main.LargeIcons, Icon = "Honey",          Window = AIAssistant.Window})
 
 		local cptsOnMouseClick = nil
 		Main.CreateApp({Name = "Click to Select", IconMap = Explorer.ClassIcons, Icon = "SelectionBox", OnClick = function(callback)
@@ -17337,6 +18007,7 @@ Main = (function()
 		SettingsWindow.Init()
 		Executor.Init()
 		RemoteSpy.Init()
+		AIAssistant.Init()
 		--SecretServicePanel.Init()
 		
 		
