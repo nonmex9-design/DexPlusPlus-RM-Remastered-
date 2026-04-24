@@ -7,7 +7,6 @@
 	Dex++ REMASTERED is an enhanced revival of Moon's Dex with improved UI,
 	smooth hover effects, additional features, and fixed decompiler support.
 ]]
--- test notif
 
 local selection
 local nodes = {}
@@ -4317,7 +4316,27 @@ local function initAfterMain()
 end
 
 local function main()
-	local Lib = {}
+	-- Global API Abstraction Layer
+--[ REPLACE YOUR OLD CLONEREF DEFINITION WITH THIS ]--
+
+local Lib = {
+    cloneref = cloneref or function(obj) return obj end,
+    gethui = gethui or function()
+        local success, coregui = pcall(function() return oldgame:GetService("CoreGui") end)
+        if success then return coregui end
+        return nil
+    end,
+}
+
+-- Optimized SafeCloneRef
+local function SafeCloneRef(instance)
+    local success, result = pcall(function() return Lib.cloneref(instance) end)
+    return success and result or instance
+end
+
+-- Use SafeCloneRef for core services immediately
+local oldgame = game
+local game = SafeCloneRef(workspace.Parent)
 
 	local renderStepped = service.RunService.RenderStepped
 	local signalWait = renderStepped.wait
@@ -18238,33 +18257,99 @@ end
 -- ============================================================
 -- ALREADY-OPEN DETECTION + STARTUP
 -- ============================================================
+--[ REPLACE GetSecureContainerEarly WITH THIS ]--
+
 local function GetSecureContainerEarly()
-	if gethui then return gethui() end
-	local elevated = pcall(function() oldgame:GetService("CoreGui"):GetFullName() end)
-	if elevated then return oldgame:GetService("CoreGui") end
-	local lp = oldgame:GetService("Players").LocalPlayer
-	return lp and lp:FindFirstChildOfClass("PlayerGui")
+    -- Try modern hidden UI first
+    local success, result = pcall(function() 
+        return Lib.gethui() 
+    end)
+    if success and result then return result end
+    
+    -- Try CoreGui
+    local success2, coreGui = pcall(function() 
+        return oldgame:GetService("CoreGui") 
+    end)
+    if success2 and coreGui then return coreGui end
+    
+    -- Final fallback to PlayerGui
+    local lp = oldgame:GetService("Players").LocalPlayer
+    return lp and lp:FindFirstChildOfClass("PlayerGui")
 end
 
+local function GetSecureContainer()
+    -- Priority 1: Custom Hidden UI (standard for many modern VMs)
+    if Lib.gethui then
+        local success, hui = pcall(Lib.gethui)
+        if success and hui then return hui end
+    end
+    
+    -- Priority 2: CoreGui (requires elevated privileges)
+    local success, coreGui = pcall(function() return oldgame:GetService("CoreGui") end)
+    if success and coreGui then return coreGui end
+    
+    -- Priority 3: LocalPlayerGui (most restricted fallback)
+    local lp = oldgame:GetService("Players").LocalPlayer
+    if lp then
+        return lp:FindFirstChildOfClass("PlayerGui")
+    end
+    
+    -- Final fallback to prevent nil errors
+    return nil
+end
+
+local function FindExistingInterface(prefix)
+    local container = GetSecureContainer()
+    if not container then return nil end
+    
+    -- Use pcall during iteration to avoid "Permission Denied" errors 
+    -- on specific child objects in restricted environments
+    local children = {}
+    pcall(function() children = container:GetChildren() end)
+    
+    for _, child in ipairs(children) do
+        local success, name = pcall(function() return child.Name end)
+        if success and name:sub(1, #prefix) == prefix then
+            -- Verify it's a UI element and not a notification toast
+            if child:IsA("ScreenGui") and not name:find("Toast") then
+                return child
+            end
+        end
+    end
+    return nil
+end
+
+--[ UPDATE THESE TWO FUNCTIONS ]--
+
 local function IsDexAlreadyOpen()
-	local c = GetSecureContainerEarly()
-	if not c then return false end
-	for _, child in ipairs(c:GetChildren()) do
-		if child.Name:sub(1,5) == "_DPP_" and not child.Name:find("Toast") and child:IsA("ScreenGui") then
-			return true
-		end
-	end
-	return false
+    local c = GetSecureContainerEarly()
+    if not c then return false end
+    
+    local children = {}
+    pcall(function() children = c:GetChildren() end)
+    
+    for _, child in ipairs(children) do
+        local success, name = pcall(function() return child.Name end)
+        if success and name:sub(1,5) == "_DPP_" and not name:find("Toast") then
+            if child:IsA("ScreenGui") then return true end
+        end
+    end
+    return false
 end
 
 local function DestroyExistingDex()
-	local c = GetSecureContainerEarly()
-	if not c then return end
-	for _, child in ipairs(c:GetChildren()) do
-		if child.Name:sub(1,5) == "_DPP_" and not child.Name:find("Toast") then
-			child:Destroy()
-		end
-	end
+    local c = GetSecureContainerEarly()
+    if not c then return end
+    
+    local children = {}
+    pcall(function() children = c:GetChildren() end)
+    
+    for _, child in ipairs(children) do
+        local success, name = pcall(function() return child.Name end)
+        if success and name:sub(1,5) == "_DPP_" and not name:find("Toast") then
+            pcall(function() child:Destroy() end)
+        end
+    end
 end
 
 if IsDexAlreadyOpen() then
